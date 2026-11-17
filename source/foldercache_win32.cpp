@@ -19,6 +19,10 @@ namespace
 {
 	constexpr DWORD kNotifyFilter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_ATTRIBUTES;
 
+	// Second watch, only for the stored file data. Writes come constantly (console.log), on the
+	// names watch they kept lookups waiting on the watcher and cost ~10 s of boot
+	constexpr DWORD kDataNotifyFilter = FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE;
+
 	HANDLE g_hThread = nullptr;
 	bool g_bBackendShutdown = false;
 }
@@ -31,6 +35,11 @@ struct FolderCache::Detail::PlatformRoot
 	std::wstring m_WidePath;
 	HANDLE m_hDir = INVALID_HANDLE_VALUE;
 	alignas( DWORD ) BYTE m_Buffer[64 * 1024];
+
+	OVERLAPPED m_DataOverlapped = {};
+	HANDLE m_hDataDir = INVALID_HANDLE_VALUE;
+	bool m_bDataArmed = false;
+	alignas( DWORD ) BYTE m_DataBuffer[64 * 1024];
 };
 
 //-----------------------------------------------------------------------------
@@ -212,6 +221,12 @@ bool FolderCache::Detail::HasUnprocessedChanges( const Root &root )
 	return !p || *(volatile ULONG_PTR *)&p->m_Overlapped.Internal != STATUS_PENDING;
 }
 
+bool FolderCache::Detail::HasUnprocessedDataChanges( const Root &root )
+{
+	const PlatformRoot *p = root.m_pPlatform;
+	return !p || !p->m_bDataArmed || *(volatile ULONG_PTR *)&p->m_DataOverlapped.Internal != STATUS_PENDING;
+}
+
 bool FolderCache::Detail::ListNode( Root &root, Node &node, std::string_view relDir )
 {
 	std::wstring pattern = root.m_pPlatform->m_WidePath;
@@ -242,6 +257,17 @@ bool FolderCache::Detail::ListNode( Root &root, Node &node, std::string_view rel
 			flags |= kFlagUnsure;
 
 		AddEntry( node, name, name, flags );
+
+		if ( !( flags & ( kFlagDir | kFlagUnsure ) ) )
+		{
+			auto ticks = []( const FILETIME &ft ) { return ( (unsigned long long)ft.dwHighDateTime << 32 ) | ft.dwLowDateTime; };
+			FolderCache::FileData &data = node.m_Data[name];
+			data.attributes = fd.dwFileAttributes;
+			data.creation = ticks( fd.ftCreationTime );
+			data.access = ticks( fd.ftLastAccessTime );
+			data.write = ticks( fd.ftLastWriteTime );
+			data.size = ( (unsigned long long)fd.nFileSizeHigh << 32 ) | fd.nFileSizeLow;
+		}
 	} while ( FindNextFileW( hFind, &fd ) );
 
 	DWORD dwError = GetLastError();
@@ -451,6 +477,26 @@ bool FolderCache::Detail::ListForFind( const std::string &pattern, FindListing &
 // Watcher thread. All ReadDirectoryChangesW calls happen on it
 //-----------------------------------------------------------------------------
 static void CALLBACK OnChanges( DWORD dwError, DWORD dwBytes, LPOVERLAPPED pOverlapped );
+static void CALLBACK OnDataChanges( DWORD dwError, DWORD dwBytes, LPOVERLAPPED pOverlapped );
+
+static bool ArmData( PlatformRoot &p )
+{
+	p.m_DataOverlapped = {};
+	p.m_DataOverlapped.Internal = STATUS_PENDING;
+	p.m_bDataArmed = p.m_hDataDir != INVALID_HANDLE_VALUE &&
+		ReadDirectoryChangesW( p.m_hDataDir, p.m_DataBuffer, sizeof( p.m_DataBuffer ), TRUE, kDataNotifyFilter, nullptr, &p.m_DataOverlapped, OnDataChanges ) != FALSE;
+	return p.m_bDataArmed;
+}
+
+static void CloseDataWatch( PlatformRoot &p )
+{
+	p.m_bDataArmed = false;
+	if ( p.m_hDataDir != INVALID_HANDLE_VALUE )
+	{
+		CloseHandle( p.m_hDataDir );
+		p.m_hDataDir = INVALID_HANDLE_VALUE;
+	}
+}
 
 static bool Arm( PlatformRoot &p )
 {
@@ -469,6 +515,11 @@ static void CloseWatch( Root &root )
 		CloseHandle( p.m_hDir );
 		p.m_hDir = INVALID_HANDLE_VALUE;
 	}
+
+	// Its own completion comes back aborted and closes it
+	if ( p.m_hDataDir != INVALID_HANDLE_VALUE )
+		CancelIoEx( p.m_hDataDir, &p.m_DataOverlapped );
+	p.m_bDataArmed = false;
 }
 
 static void ProcessChanges( Root &root, DWORD dwBytes )
@@ -537,6 +588,57 @@ struct ArmRequest
 	HANDLE m_hDone;
 };
 
+// Data watch: anything written, its stored size and times are gone
+static void CALLBACK OnDataChanges( DWORD dwError, DWORD dwBytes, LPOVERLAPPED pOverlapped )
+{
+	PlatformRoot *p = CONTAINING_RECORD( pOverlapped, PlatformRoot, m_DataOverlapped );
+	Root &root = *p->m_pRoot;
+
+	std::unique_lock<std::shared_mutex> lock( g_Lock );
+
+	if ( g_bBackendShutdown || !root.m_bActive || dwError == ERROR_OPERATION_ABORTED ||
+		( dwError != ERROR_SUCCESS && dwError != ERROR_NOTIFY_ENUM_DIR ) )
+	{
+		ClearAllData( root );
+		CloseDataWatch( *p );
+		return;
+	}
+
+	// 0 bytes = the change buffer overflowed
+	if ( dwError != ERROR_SUCCESS || dwBytes == 0 )
+		ClearAllData( root );
+	else
+	{
+		std::string rel;
+		const BYTE *it = p->m_DataBuffer;
+		const BYTE *end = it + dwBytes;
+		while ( it + sizeof( FILE_NOTIFY_INFORMATION ) <= end )
+		{
+			auto *info = (const FILE_NOTIFY_INFORMATION *)it;
+			FoldWideName( info->FileName, info->FileNameLength / sizeof( wchar_t ), rel );
+
+			// Short names we can't map back
+			if ( HasShortNameMarker( rel ) )
+			{
+				ClearAllData( root );
+				break;
+			}
+
+			MarkDataChanged( root, rel );
+
+			if ( !info->NextEntryOffset )
+				break;
+			it += info->NextEntryOffset;
+		}
+	}
+
+	if ( !ArmData( *p ) )
+	{
+		ClearAllData( root );
+		CloseDataWatch( *p );
+	}
+}
+
 static void CALLBACK ArmApc( ULONG_PTR param )
 {
 	auto *req = (ArmRequest *)param;
@@ -545,7 +647,11 @@ static void CALLBACK ArmApc( ULONG_PTR param )
 	{
 		std::unique_lock<std::shared_mutex> lock( g_Lock );
 		if ( Arm( *root.m_pPlatform ) )
+		{
 			root.m_bActive = true;
+			if ( !ArmData( *root.m_pPlatform ) )
+				CloseDataWatch( *root.m_pPlatform );
+		}
 		else
 			CloseWatch( root );
 	}
@@ -558,7 +664,11 @@ static void CALLBACK ShutdownApc( ULONG_PTR )
 	std::unique_lock<std::shared_mutex> lock( g_Lock );
 	g_bBackendShutdown = true;
 	for ( Root *root : g_Roots )
+	{
 		CancelIoEx( root->m_pPlatform->m_hDir, &root->m_pPlatform->m_Overlapped );
+		if ( root->m_pPlatform->m_hDataDir != INVALID_HANDLE_VALUE )
+			CancelIoEx( root->m_pPlatform->m_hDataDir, &root->m_pPlatform->m_DataOverlapped );
+	}
 }
 
 static DWORD WINAPI WatcherThread( void * )
@@ -596,6 +706,10 @@ bool FolderCache::Detail::PrepareRoot( Root &root )
 		return false;
 	}
 
+	// No data watch just means no stat cache for this root
+	p->m_hDataDir = CreateFileW( p->m_WidePath.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr );
+
 	if ( !g_hThread )
 	{
 		g_hThread = CreateThread( nullptr, 64 * 1024, WatcherThread, nullptr, 0, nullptr );
@@ -626,7 +740,11 @@ void FolderCache::Detail::RetireRoot( Root &root )
 {
 	// The aborted completion closes the handle on the watcher thread
 	if ( root.m_pPlatform )
+	{
 		CancelIoEx( root.m_pPlatform->m_hDir, &root.m_pPlatform->m_Overlapped );
+		if ( root.m_pPlatform->m_hDataDir != INVALID_HANDLE_VALUE )
+			CancelIoEx( root.m_pPlatform->m_hDataDir, &root.m_pPlatform->m_DataOverlapped );
+	}
 }
 
 void FolderCache::Detail::ShutdownBackend()

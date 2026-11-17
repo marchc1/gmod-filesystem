@@ -254,28 +254,13 @@ int CTextConsoleWin32::GetWidth( void )
 	return nWidth;
 } 
 
+// Stock has no status line, both of these are empty there
 void CTextConsoleWin32::SetStatusLine( const char * pszStatus )
 {
-	strncpy( statusline, pszStatus, 80 );
-	statusline[ 79 ] = '\0';
-	UpdateStatus();
 }
 
 void CTextConsoleWin32::UpdateStatus( void )
 {
-	COORD	coord;
-	DWORD	dwWritten = 0;
-	WORD	wAttrib[ 80 ];
-	
-	for ( int i = 0; i < 80; i++ )
-	{
-		wAttrib[i] = Attrib; //FOREGROUND_GREEN | FOREGROUND_INTENSITY | BACKGROUND_INTENSITY ;
-	}
-
-	coord.X = coord.Y = 0;
-
-	WriteConsoleOutputAttribute( houtput, wAttrib, 80, coord, &dwWritten );
-	WriteConsoleOutputCharacter( houtput, statusline, 80, coord, &dwWritten );	
 }
 
 

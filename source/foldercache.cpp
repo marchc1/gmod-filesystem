@@ -16,6 +16,11 @@ static bool IsFindTurnedOff()
 {
 	return getenv( "FOLDERCACHE_NOFIND" ) != nullptr;
 }
+
+static bool IsStatTurnedOff()
+{
+	return getenv( "FOLDERCACHE_NOSTAT" ) != nullptr;
+}
 #else
 #include "tier0/icommandline.h"
 #include "tier1/convar.h"
@@ -33,6 +38,13 @@ static ConVar filesystem_findcache( "filesystem_findcache", "1", 0, "Answer Find
 static bool IsFindTurnedOff()
 {
 	return !filesystem_findcache.GetBool();
+}
+
+static ConVar filesystem_statcache( "filesystem_statcache", "1", 0, "Answer stat on listed files from what the folder listing said" );
+
+static bool IsStatTurnedOff()
+{
+	return !filesystem_statcache.GetBool();
 }
 #endif
 
@@ -157,6 +169,7 @@ void FolderCache::Detail::ClearNode( Node &node )
 	node.m_nUnsure = 0;
 	node.m_Names.clear();
 	node.m_Folded.clear();
+	node.m_Data.clear();
 }
 
 void FolderCache::Detail::ResetTree( Root &root )
@@ -331,6 +344,7 @@ void FolderCache::Detail::MarkChanged( Root &root, std::string_view rel )
 		if ( sep == std::string_view::npos )
 		{
 			std::string_view last = rel.substr( pos );
+			node->m_Data.erase( last );
 			if ( node->m_bListed )
 			{
 				// Could exist now or not, the OS decides until we list again
@@ -390,6 +404,29 @@ static void TrimSeparators( std::string_view &rel )
 		rel.remove_suffix( 1 );
 }
 
+static void ClearDataBelow( Node &node )
+{
+	node.m_Data.clear();
+	for ( auto &child : node.m_Children )
+		ClearDataBelow( *child.second );
+}
+
+void FolderCache::Detail::ClearAllData( Root &root )
+{
+	ClearDataBelow( root.m_Tree );
+}
+
+void FolderCache::Detail::MarkDataChanged( Root &root, std::string_view rel )
+{
+	TrimSeparators( rel );
+	if ( rel.empty() )
+		return;
+
+	std::string_view last;
+	if ( Node *node = FindParentNode( root, rel, last ) )
+		node->m_Data.erase( last );
+}
+
 void FolderCache::Detail::MarkRemoved( Root &root, std::string_view rel )
 {
 	TrimSeparators( rel );
@@ -405,6 +442,8 @@ void FolderCache::Detail::MarkRemoved( Root &root, std::string_view rel )
 	Node *node = FindParentNode( root, rel, last );
 	if ( !node )
 		return;
+
+	node->m_Data.erase( last );
 
 	auto child = node->m_Children.find( last );
 	if ( child != node->m_Children.end() )
@@ -462,6 +501,8 @@ void FolderCache::Detail::MarkAdded( Root &root, std::string_view rel, unsigned 
 	Node *node = FindParentNode( root, rel, last );
 	if ( !node )
 		return;
+
+	node->m_Data.erase( last );
 
 	// Whatever we knew about it as a folder is stale
 	auto child = node->m_Children.find( last );
@@ -618,6 +659,63 @@ bool FolderCache::IsKnownMissing( const char *pAbsolutePath )
 	}
 
 	return result == Result::Missing;
+}
+
+bool FolderCache::GetFileData( const char *pAbsolutePath, FileData *pOut )
+{
+	if ( !pAbsolutePath || IsDisabled() || IsStatTurnedOff() )
+		return false;
+
+	char buf[kMaxPath];
+	int len = NormalizePath( pAbsolutePath, buf, sizeof( buf ) );
+	if ( len < 0 )
+		return false;
+
+	std::string_view path( buf, len );
+	Root *root = nullptr;
+	std::string_view rel;
+
+	// Present, sure about it, a file, and we still have its data
+	auto lookup = [&]( bool bAllowList ) -> Result {
+		Result result = Walk( *root, rel, bAllowList );
+		if ( result != Result::Present )
+			return result;
+
+		std::string_view last;
+		Node *node = FindParentNode( *root, rel, last );
+		if ( !node )
+			return Result::Unknown;
+
+		const unsigned char *pFlags = FindFinalEntry( *node, last );
+		auto it = node->m_Data.find( last );
+		if ( !pFlags || ( *pFlags & ( kFlagUnsure | kFlagDir ) ) || it == node->m_Data.end() )
+			return Result::Unknown;
+
+		*pOut = it->second;
+		return Result::Present;
+	};
+
+	Result result = Result::Unknown;
+	{
+		std::shared_lock<std::shared_mutex> lock( g_Lock );
+		root = FindRoot( path, false );
+		if ( root && root->m_bActive && !HasUnprocessedChanges( *root ) && !HasUnprocessedDataChanges( *root ) )
+		{
+			rel = path.substr( root->m_Path.size() );
+			if ( IsSimpleRelative( rel ) )
+				result = lookup( false );
+		}
+	}
+
+	if ( result == Result::NeedList )
+	{
+		std::unique_lock<std::shared_mutex> lock( g_Lock );
+		result = Result::Unknown;
+		if ( FindRoot( path, false ) == root && root->m_bActive && !HasUnprocessedChanges( *root ) && !HasUnprocessedDataChanges( *root ) )
+			result = lookup( true );
+	}
+
+	return result == Result::Present;
 }
 
 void FolderCache::OnPathChanged( const char *pAbsolutePath )
@@ -877,6 +975,7 @@ bool FolderCache::Detail::PrepareRoot( Root & ) { return false; }
 void FolderCache::Detail::ActivateRoot( Root & ) {}
 void FolderCache::Detail::RetireRoot( Root & ) {}
 bool FolderCache::Detail::HasUnprocessedChanges( const Root & ) { return true; }
+bool FolderCache::Detail::HasUnprocessedDataChanges( const Root & ) { return true; }
 bool FolderCache::Detail::ListNode( Root &, Node &, std::string_view ) { return false; }
 void FolderCache::Detail::ShutdownBackend() {}
 bool FolderCache::Detail::ParseFindPattern( std::string_view, FindPattern & ) { return false; }

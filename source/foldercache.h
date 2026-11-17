@@ -60,6 +60,19 @@ namespace FolderCache
 	// The path is lowercase, backslashes. Keep it short, don't call back into FolderCache
 	using ChangeFn = void ( * )( const char *pAbsolutePath, size_t nLen );
 	void SetChangeCallback( ChangeFn fn );
+
+	// What the folder listing said about a file. Windows only, times are FILETIME ticks
+	struct FileData
+	{
+		unsigned int attributes;
+		unsigned long long creation;
+		unsigned long long access;
+		unsigned long long write;
+		unsigned long long size;
+	};
+
+	// stat without the OS, for files we listed and haven't seen change since. false = ask the OS
+	bool GetFileData( const char *pAbsolutePath, FileData *pOut );
 }
 
 #endif

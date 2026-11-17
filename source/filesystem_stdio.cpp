@@ -35,6 +35,9 @@
 #undef min
 #undef max
 #include <system_error>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include "sdk_backports.h"
 
 // memdbgon must be the last include file in a .cpp file!!!
@@ -379,6 +382,56 @@ void *CFileSystem_Stdio::AllocOptimalReadBuffer( FileHandle_t hFile, unsigned nS
 }
 
 
+#ifdef _WIN32
+// Files we have open for writing. A listing taken meanwhile can hold an old size and time for them
+static std::mutex s_OpenWritesLock;
+static std::unordered_map<FILE *, std::string> s_OpenWrites;
+static std::unordered_map<std::string, int> s_OpenWriteCounts;
+
+static void LowerPath( const char *pPath, std::string &out )
+{
+	out = pPath;
+	for ( char &c : out )
+		c = ( c >= 'A' && c <= 'Z' ) ? (char)( c + 'a' - 'A' ) : ( c == '/' ? '\\' : c );
+}
+
+static void NoteOpenForWrite( FILE *fp, const char *pPath )
+{
+	std::string key;
+	LowerPath( pPath, key );
+	std::lock_guard<std::mutex> lock( s_OpenWritesLock );
+	++s_OpenWriteCounts[key];
+	s_OpenWrites[fp] = std::move( key );
+}
+
+// Path it was opened with, empty if it wasn't a write
+static std::string NoteClosed( FILE *fp )
+{
+	std::lock_guard<std::mutex> lock( s_OpenWritesLock );
+	auto it = s_OpenWrites.find( fp );
+	if ( it == s_OpenWrites.end() )
+		return {};
+
+	std::string key = std::move( it->second );
+	s_OpenWrites.erase( it );
+	auto count = s_OpenWriteCounts.find( key );
+	if ( count != s_OpenWriteCounts.end() && --count->second <= 0 )
+		s_OpenWriteCounts.erase( count );
+	return key;
+}
+
+static bool IsOpenForWrite( const char *pPath )
+{
+	std::lock_guard<std::mutex> lock( s_OpenWritesLock );
+	if ( s_OpenWriteCounts.empty() )
+		return false;
+
+	std::string key;
+	LowerPath( pPath, key );
+	return s_OpenWriteCounts.count( key ) != 0;
+}
+#endif
+
 //-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
 void CFileSystem_Stdio::FreeOptimalReadBuffer( void *p )
@@ -431,7 +484,13 @@ FILE *CFileSystem_Stdio::FS_fopen( const char *filenameT, const char *options, u
 	pFile = CStdioFile::FS_fopen( filename, options, size );
 
 	if ( !bReadOnly )
+	{
 		FolderCache::OnPathChanged( filename );
+#ifdef _WIN32
+		if ( pFile )
+			NoteOpenForWrite( reinterpret_cast<FILE *>( pFile ), filename );
+#endif
+	}
 
 	return reinterpret_cast<FILE *>(pFile);
 }
@@ -452,8 +511,19 @@ void CFileSystem_Stdio::FS_fclose( FILE *fp )
 {
 	auto *pFile = reinterpret_cast<CStdFilesystemFile *>(fp);
 
+#ifdef _WIN32
+	// Before the delete, the pointer can come back from the next fopen
+	const std::string written = NoteClosed( fp );
+#endif
+
 	pFile->FS_fclose();
 	delete pFile;
+
+#ifdef _WIN32
+	// Size and times are final now
+	if ( !written.empty() )
+		FolderCache::OnPathChanged( written.c_str() );
+#endif
 }
 
 //-----------------------------------------------------------------------------
@@ -617,7 +687,18 @@ static bool IsExecutableExtension( const char *path )
 static int Win32Stat( const char *path, struct _stat *buf )
 {
 	WIN32_FILE_ATTRIBUTE_DATA data;
-	if ( !GetFileAttributesExA( path, GetFileExInfoStandard, &data ) )
+	FolderCache::FileData cached;
+	if ( !IsOpenForWrite( path ) && FolderCache::GetFileData( path, &cached ) )
+	{
+		auto toFileTime = []( unsigned long long ticks ) { return FILETIME{ (DWORD)ticks, (DWORD)( ticks >> 32 ) }; };
+		data.dwFileAttributes = cached.attributes;
+		data.ftCreationTime = toFileTime( cached.creation );
+		data.ftLastAccessTime = toFileTime( cached.access );
+		data.ftLastWriteTime = toFileTime( cached.write );
+		data.nFileSizeHigh = (DWORD)( cached.size >> 32 );
+		data.nFileSizeLow = (DWORD)cached.size;
+	}
+	else if ( !GetFileAttributesExA( path, GetFileExInfoStandard, &data ) )
 	{
 		errno = ENOENT;
 		return -1;

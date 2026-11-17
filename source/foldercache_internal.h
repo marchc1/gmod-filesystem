@@ -61,6 +61,9 @@ namespace FolderCache::Detail
 
 		// Same keys as m_Names
 		unordered_map<std::string, std::unique_ptr<Node>, StringHash, StringEq> m_Children;
+
+		// Files only, same keys as m_Names. Dropped when the file is written to
+		unordered_map<std::string, FolderCache::FileData, StringHash, StringEq> m_Data;
 	};
 
 	// A folder the way FindFirstFile( folder\* ) returns it, in that order, . and .. included
@@ -111,6 +114,8 @@ namespace FolderCache::Detail
 	void MarkChanged( Root &root, std::string_view rel ); // don't know what happened to it, the OS decides
 	void MarkRemoved( Root &root, std::string_view rel ); // it's gone
 	void MarkAdded( Root &root, std::string_view rel, unsigned char flags ); // it's there, flags = what it is now
+	void MarkDataChanged( Root &root, std::string_view rel ); // still there, its size or times changed
+	void ClearAllData( Root &root ); // every stored size and time in the root
 	void DropRoot( Root &root ); // stops using it, the backend cleans up its handles
 	void RetireRootsUnder( const std::string &absPath );
 	void ClearNode( Node &node );
@@ -146,6 +151,9 @@ namespace FolderCache::Detail
 
 	// The watcher has news for this root it didn't apply yet
 	bool HasUnprocessedChanges( const Root &root );
+
+	// Same for the writes watch, or there is none. Stored file data can't be trusted then
+	bool HasUnprocessedDataChanges( const Root &root );
 
 	// Exclusive lock held. Fills node with AddEntry. false = can't trust the result
 	bool ListNode( Root &root, Node &node, std::string_view relDir );

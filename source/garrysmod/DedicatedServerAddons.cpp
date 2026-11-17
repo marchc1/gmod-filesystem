@@ -724,15 +724,18 @@ namespace
 			return false;
 		}
 
+		// Stock checks every 250 ms. Same dots, but we notice the logon sooner
 		int nWaited = 0;
 		while ( !SteamGameServer()->BLoggedOn() )
 		{
 			if ( nWaited == 0 )
 				ConColorMsg( s_Cyan, "WS: Waiting for Steam to log us in" );
 
-			ThreadSleep( 250 );
-			nWaited += 250;
-			ConColorMsg( s_Cyan, "." );
+			ThreadSleep( 10 );
+			nWaited += 10;
+			// One per 250 ms started, like stock's
+			if ( nWaited % 250 == 10 )
+				ConColorMsg( s_Cyan, "." );
 			get->RunSteamCallbacks();
 
 			if ( nWaited > 10000 )

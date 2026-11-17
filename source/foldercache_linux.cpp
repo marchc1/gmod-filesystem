@@ -136,6 +136,12 @@ bool FolderCache::Detail::HasUnprocessedChanges( const Root & )
 	return g_nApplying.load( std::memory_order_acquire ) != 0 || PendingEventBytes() > 0;
 }
 
+// No stored file data here, stat always goes to the OS
+bool FolderCache::Detail::HasUnprocessedDataChanges( const Root & )
+{
+	return true;
+}
+
 static void AddWatchTarget( int wd, Root &root, std::string_view relDir )
 {
 	auto &targets = g_Watches[wd];
