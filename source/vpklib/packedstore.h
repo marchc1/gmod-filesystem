@@ -25,7 +25,11 @@
 #include "tier1/checksum_md5.h"
 
 #include "sdk_backports.h"
+#include "unordered_stuff.h"
 #include <atomic>
+#include <string>
+#include <utility>
+#include <vector>
 
 // RaphaelIT7: GMod doesn't use this
 // #define VPK_ENABLE_SIGNING
@@ -137,18 +141,31 @@ typedef HANDLE PackDataFileHandle_t;
 typedef FileHandle_t PackDataFileHandle_t;
 #endif
 
+// Archives get mapped into memory, reads become a memcpy. 64 bit only, needs the address space
+#if defined( IS_WINDOWS_PC ) && defined( PLATFORM_64BITS )
+#define VPK_MAPPED_READS
+#endif
+
 struct FileHandleTracker_t
 {
 	int m_nFileNumber;
 	PackDataFileHandle_t m_hFileHandle;
 	int m_nCurOfs;
 	CThreadFastMutex m_Mutex;
+#ifdef VPK_MAPPED_READS
+	const uint8 *m_pMapped;
+	int64 m_nMappedSize;
+#endif
 
 	FileHandleTracker_t( void )
 	{
 		m_nFileNumber = -1;
 		m_hFileHandle = nullptr;
 		m_nCurOfs = 0;
+#ifdef VPK_MAPPED_READS
+		m_pMapped = nullptr;
+		m_nMappedSize = 0;
+#endif
 	}
 };
 
@@ -247,6 +264,17 @@ public:
 	void RetryBadCacheLine( CachedVPKRead_t &cachedVPKRead );
 	void RetryAllBadCacheLines();
 
+#ifdef VPK_MAPPED_READS
+	// Mapped reads skip the cache, but the chunks still get MD5'd once, like a cache line would
+	void NoteMappedRead( FileHandleTracker_t &fHandle, int nPackFileNumber, int nDesiredPos, int nNumBytes );
+
+	// CFileTracker2::m_cComputedMD5ForVPKFiles, 0 means nobody wants hashes
+	const size_t *m_pnTrackedVPKFiles = nullptr;
+	CThreadFastMutex m_MappedHashMutex;
+	CUtlRBTree<CachedVPKRead_t> m_treeMappedChunksHashed{ CachedVPKRead_t::Less };
+	CUtlVector<CachedVPKRead_t> m_MappedHashesPending;
+#endif
+
 
 	// cache 64 MiB total
 	static constexpr inline int k_nCacheBuffersToKeep = 8;
@@ -286,6 +314,14 @@ public:
 	CPackedStore( char const *pFileBasename, char *pszFName, intp fnameSize, IBaseFileSystem *pFS, bool bOpenForWrite = false );
 
 	void RegisterFileTracker( IThreadedFileMD5Processor *pFileTracker ) { m_pFileTracker = pFileTracker; m_PackedStoreReadCache.m_pFileTracker = pFileTracker; }
+#ifdef VPK_MAPPED_READS
+	void RegisterTrackedVPKFileCount( const size_t *pnCount ) { m_PackedStoreReadCache.m_pnTrackedVPKFiles = pnCount; }
+#endif
+
+	// Every file in the directory, as the dir/base/ext strings FindFileEntry compares against.
+	// bReachable = FindFileEntry can find it, the rest are shadowed by an earlier ext/dir node of the same name
+	// (GetFileList and the FindFirst cache still see those)
+	void ForEachFile( void ( *fn )( void *pCtx, const char *pDir, const char *pBase, const char *pExt, bool bReachable ), void *pCtx );
 
 	CPackedStoreFileHandle OpenFile( char const *pFile );
 	CPackedStoreFileHandle GetHandleForHashingFiles();
@@ -408,6 +444,10 @@ public:
 	void SetUseDirFile() { m_bUseDirFile = true; }
 
 	int m_PackFileID;
+
+	// Unique per instance, a new store can end up at a freed one's address
+	uint64 m_nInstanceSerial = s_nNextInstanceSerial.fetch_add( 1 ) + 1;
+	static inline std::atomic<uint64> s_nNextInstanceSerial{ 0 };
 private:
 	char m_pszFileBaseName[MAX_PATH];
 	char m_pszFullPathName[MAX_PATH];
@@ -422,6 +462,21 @@ private:
 	CPackedStoreReadCache m_PackedStoreReadCache;
 
 	CUtlIntrusiveList<class CFileExtensionData> m_pExtensionData[PACKEDFILE_EXT_HASH_SIZE];
+
+	// dir/base/ext hash -> the entry FindFileEntryLinear would find. Built on first lookup
+	struct FileIndexEntry_t
+	{
+		const char *m_pName;
+		const class CFileDirectoryData *m_pDir;
+		const class CFileExtensionData *m_pExt;
+		bool m_bCollision;
+	};
+	unordered_map<uint64, FileIndexEntry_t> m_FileIndex;
+	std::atomic<bool> m_bFileIndexBuilt{ false };
+	CThreadFastMutex m_FileIndexMutex;
+	void BuildFileIndex();
+	void ResetFileIndex();
+	CFileHeaderFixedData *FindFileEntryLinear( char const *pDirname, char const *pBaseName, char const *pExtension, uint8 **pExtBaseOut, uint8 **pNameBaseOut );
 
 	CUtlVector<uint8> m_DirectoryData;
 	CUtlBlockVector<uint8> m_EmbeddedChunkData;
@@ -465,6 +520,12 @@ private:
 	CUtlStringList m_directoryList; // The index of this list of directories...
 	CUtlMap<intp, CUtlStringList*, intp> m_dirContents; // ...is the key to this map of filenames
 	void BuildFindFirstCache();
+
+	// m_directoryList lowercased and sorted, with each one's index. Only built when every name is ASCII,
+	// V_strnicmp goes to the locale for anything else
+	std::vector<std::pair<std::string, intp>> m_SortedDirs;
+	bool m_bSortedDirsUsable = false;
+	bool SortedDirIndexes( const char *pszLower, bool bPrefix, CUtlVector<intp> &out ) const;
 
 	bool InternalRemoveFileFromDirectory( const char *pszName );
 

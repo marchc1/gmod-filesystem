@@ -5,6 +5,9 @@
 //===========================================================================//
 
 #include "vpklib/packedstore.h"
+#include <algorithm>
+#include <set>
+#include <string_view>
 #include "packedstore_internal.h"
 #include "tier1/utlintrusivelist.h"
 #include "tier1/generichash.h"
@@ -31,6 +34,45 @@
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
+
+#ifdef VPK_MAPPED_READS
+static const uint8 *MapArchive( HANDLE hFile, int64 &nSize )
+{
+	nSize = 0;
+
+	LARGE_INTEGER size;
+	if ( !GetFileSizeEx( hFile, &size ) || size.QuadPart <= 0 )
+		return nullptr;
+
+	HANDLE hMapping = CreateFileMappingW( hFile, nullptr, PAGE_READONLY, 0, 0, nullptr );
+	if ( !hMapping )
+		return nullptr;
+
+	// The view keeps the mapping alive
+	void *pView = MapViewOfFile( hMapping, FILE_MAP_READ, 0, 0, 0 );
+	CloseHandle( hMapping );
+	if ( !pView )
+		return nullptr;
+
+	nSize = size.QuadPart;
+	return (const uint8 *)pView;
+}
+
+// A disk error on a mapped page is an exception instead of a failed ReadFile.
+// false = go read it the old way
+static bool CopyFromMapping( void *pDest, const uint8 *pSrc, size_t nBytes )
+{
+	__try
+	{
+		memcpy( pDest, pSrc, nBytes );
+		return true;
+	}
+	__except ( GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH )
+	{
+		return false;
+	}
+}
+#endif
 
 
 typedef uint16 PackFileIndex_t;
@@ -156,7 +198,135 @@ static inline int SkipAllFilesInDir( char const * & pData )
 }
 
 
+static uint64 HashFileTriple( const char *pDir, const char *pBase, const char *pExt )
+{
+	uint64 h = 14695981039346656037ull;
+	for ( const char *s : { pDir, pBase, pExt } )
+	{
+		for ( ; *s; ++s )
+			h = ( h ^ (uint8)*s ) * 1099511628211ull;
+		h *= 1099511628211ull;
+	}
+	return h;
+}
+
+template <class T>
+static bool IsShadowed( T *pHead, T *pNode )
+{
+	// FindNamedNodeCaseSensitive stops at the first name match, nodes after it are never reached
+	for ( T *p = pHead; p != pNode; p = p->m_pNext )
+	{
+		if ( !strcmp( p->m_Name, pNode->m_Name ) )
+			return true;
+	}
+	return false;
+}
+
+void CPackedStore::BuildFileIndex()
+{
+	AUTO_LOCK( m_FileIndexMutex );
+	if ( m_bFileIndexBuilt.load( std::memory_order_acquire ) )
+		return;
+
+	m_FileIndex.clear();
+	for ( auto &extBucket : m_pExtensionData )
+	{
+		for ( CFileExtensionData *pExt = extBucket.m_pHead; pExt; pExt = pExt->m_pNext )
+		{
+			if ( IsShadowed( extBucket.m_pHead, pExt ) )
+				continue;
+
+			for ( auto &dirBucket : pExt->m_pDirectoryHashTable )
+			{
+				for ( CFileDirectoryData *pDir = dirBucket.m_pHead; pDir; pDir = pDir->m_pNext )
+				{
+					if ( IsShadowed( dirBucket.m_pHead, pDir ) )
+						continue;
+
+					char const *pData = pDir->m_Name;
+					pData += 1 + strlen( pData );
+					while ( *pData )
+					{
+						auto [it, bInserted] = m_FileIndex.try_emplace( HashFileTriple( pDir->m_Name, pData, pExt->m_Name ), FileIndexEntry_t{ pData, pDir, pExt, false } );
+
+						// Same name again in this dir: the first one wins, like the linear walk.
+						// Different name with the same hash: send those lookups down the slow path
+						if ( !bInserted && !( it->second.m_pDir == pDir && it->second.m_pExt == pExt && !strcmp( it->second.m_pName, pData ) ) )
+							it->second.m_bCollision = true;
+
+						SkipFile( pData );
+					}
+				}
+			}
+		}
+	}
+
+	m_bFileIndexBuilt.store( true, std::memory_order_release );
+}
+
+void CPackedStore::ForEachFile( void ( *fn )( void *pCtx, const char *pDir, const char *pBase, const char *pExt, bool bReachable ), void *pCtx )
+{
+	for ( auto &extBucket : m_pExtensionData )
+	{
+		for ( CFileExtensionData *pExt = extBucket.m_pHead; pExt; pExt = pExt->m_pNext )
+		{
+			const bool bExtReachable = !IsShadowed( extBucket.m_pHead, pExt );
+
+			for ( auto &dirBucket : pExt->m_pDirectoryHashTable )
+			{
+				for ( CFileDirectoryData *pDir = dirBucket.m_pHead; pDir; pDir = pDir->m_pNext )
+				{
+					const bool bReachable = bExtReachable && !IsShadowed( dirBucket.m_pHead, pDir );
+
+					char const *pData = pDir->m_Name;
+					pData += 1 + strlen( pData );
+					while ( *pData )
+					{
+						fn( pCtx, pDir->m_Name, pData, pExt->m_Name, bReachable );
+						SkipFile( pData );
+					}
+				}
+			}
+		}
+	}
+}
+
+void CPackedStore::ResetFileIndex()
+{
+	AUTO_LOCK( m_FileIndexMutex );
+	m_FileIndex.clear();
+	m_bFileIndexBuilt.store( false, std::memory_order_release );
+}
+
 CFileHeaderFixedData *CPackedStore::FindFileEntry( char const *pDirname, char const *pBaseName, char const *pExtension, uint8 **pExtBaseOut , uint8 **pNameBaseOut )
+{
+	if ( !m_bFileIndexBuilt.load( std::memory_order_acquire ) )
+		BuildFileIndex();
+
+	auto it = m_FileIndex.find( HashFileTriple( pDirname, pBaseName, pExtension ) );
+	if ( it == m_FileIndex.end() )
+	{
+		if ( pExtBaseOut )
+			*pExtBaseOut = NULL;
+		if ( pNameBaseOut )
+			*pNameBaseOut = NULL;
+		return NULL;
+	}
+
+	const FileIndexEntry_t &entry = it->second;
+	if ( !entry.m_bCollision && !strcmp( entry.m_pName, pBaseName ) && !strcmp( entry.m_pDir->m_Name, pDirname ) && !strcmp( entry.m_pExt->m_Name, pExtension ) )
+	{
+		if ( pExtBaseOut )
+			*pExtBaseOut = (uint8 *)entry.m_pDir;
+		if ( pNameBaseOut )
+			*pNameBaseOut = (uint8 *)entry.m_pName;
+		return (CFileHeaderFixedData *)( entry.m_pName + 1 + V_strlen( entry.m_pName ) );
+	}
+
+	return FindFileEntryLinear( pDirname, pBaseName, pExtension, pExtBaseOut, pNameBaseOut );
+}
+
+CFileHeaderFixedData *CPackedStore::FindFileEntryLinear( char const *pDirname, char const *pBaseName, char const *pExtension, uint8 **pExtBaseOut , uint8 **pNameBaseOut )
 {
 	if ( pExtBaseOut )
 		*pExtBaseOut = NULL;
@@ -229,6 +399,9 @@ void CPackedStore::Init( void )
    
 void CPackedStore::BuildHashTables( void )
 {
+	// It points into the nodes we're about to free
+	ResetFileIndex();
+
 	m_nHighestChunkFileIndex = -1;
 	for( auto &&extensionData : m_pExtensionData )
 	{
@@ -471,6 +644,10 @@ CPackedStore::~CPackedStore( void )
 	{
 		if ( fileHandle.m_nFileNumber != -1 )
 		{
+#ifdef VPK_MAPPED_READS
+			if ( fileHandle.m_pMapped )
+				UnmapViewOfFile( fileHandle.m_pMapped );
+#endif
 #ifdef IS_WINDOWS_PC
 			CloseHandle( fileHandle.m_hFileHandle );
 #else
@@ -569,23 +746,33 @@ void SplitFileComponents( char const *pFileName, char (&pDirOut)[MAX_PATH], char
 
 CPackedStoreFileHandle CPackedStore::OpenFile( char const *pFileName )
 {
-	char dirName[MAX_PATH];
-	char baseName[MAX_PATH];
-	char extName[MAX_PATH];
+	// Every VPK search path gets asked for the same name in a row, only split it once.
+	// The split only depends on the first MAX_PATH-1 chars
+	thread_local char tl_szLastName[MAX_PATH] = { 0 };
+	thread_local bool tl_bHaveLast = false;
+	thread_local char dirName[MAX_PATH];
+	thread_local char baseName[MAX_PATH];
+	thread_local char extName[MAX_PATH];
 
-	// Fix up the filename first
-	char tempFileName[MAX_PATH];
-
-	V_strncpy( tempFileName, pFileName, sizeof( tempFileName ) );
-	V_FixSlashes( tempFileName, CORRECT_PATH_SEPARATOR );
-//	V_RemoveDotSlashes( tempFileName, CORRECT_PATH_SEPARATOR, true );
-	V_FixDoubleSlashes( tempFileName );
-	if ( !V_IsAbsolutePath( tempFileName ) )
+	if ( !tl_bHaveLast || strncmp( pFileName, tl_szLastName, MAX_PATH - 1 ) != 0 )
 	{
-		V_strlower( tempFileName );
+		// Fix up the filename first
+		char tempFileName[MAX_PATH];
+
+		V_strncpy( tempFileName, pFileName, sizeof( tempFileName ) );
+		V_FixSlashes( tempFileName, CORRECT_PATH_SEPARATOR );
+	//	V_RemoveDotSlashes( tempFileName, CORRECT_PATH_SEPARATOR, true );
+		V_FixDoubleSlashes( tempFileName );
+		if ( !V_IsAbsolutePath( tempFileName ) )
+		{
+			V_strlower( tempFileName );
+		}
+
+		SplitFileComponents( tempFileName, dirName, baseName, extName );
+
+		V_strncpy( tl_szLastName, pFileName, sizeof( tl_szLastName ) );
+		tl_bHaveLast = true;
 	}
-	
-	SplitFileComponents( tempFileName, dirName, baseName, extName );
 
 	CPackedStoreFileHandle ret;
 
@@ -1135,6 +1322,49 @@ void CPackedStoreReadCache::RetryAllBadCacheLines()
 //	}
 }
 
+#ifdef VPK_MAPPED_READS
+void CPackedStoreReadCache::NoteMappedRead( FileHandleTracker_t &fHandle, int nPackFileNumber, int nDesiredPos, int nNumBytes )
+{
+	if ( !m_pFileTracker || !m_pnTrackedVPKFiles || !*(volatile const size_t *)m_pnTrackedVPKFiles )
+		return;
+
+	AUTO_LOCK( m_MappedHashMutex );
+
+	for ( intp i = m_MappedHashesPending.Count() - 1; i >= 0; --i )
+	{
+		CachedVPKRead_t &pending = m_MappedHashesPending[i];
+		if ( m_pFileTracker->IsMD5RequestComplete( pending.m_hMD5RequestHandle, &pending.m_md5Value ) )
+		{
+			pending.m_hMD5RequestHandle = 0;
+			CheckMd5Result( pending );
+			m_MappedHashesPending.FastRemove( i );
+		}
+	}
+
+	const int nFirst = nDesiredPos & k_nCacheBufferMask;
+	const int nLast = ( nDesiredPos + nNumBytes - 1 ) & k_nCacheBufferMask;
+	for ( int nFraction = nFirst; nFraction <= nLast; nFraction += k_cubCacheBufferSize )
+	{
+		CachedVPKRead_t chunk;
+		chunk.m_nPackFileNumber = nPackFileNumber;
+		chunk.m_nFileFraction = nFraction;
+		if ( m_treeMappedChunksHashed.Find( chunk ) != m_treeMappedChunksHashed.InvalidIndex() )
+			continue;
+
+		const int nChunkSize = (int)Min<int64>( k_cubCacheBufferSize, fHandle.m_nMappedSize - nFraction );
+		chunk.m_hMD5RequestHandle = m_pFileTracker->SubmitThreadedMD5Request( const_cast<uint8 *>( fHandle.m_pMapped ) + nFraction,
+			nChunkSize, m_pPackedStore->m_PackFileID, nPackFileNumber, nFraction );
+
+		// 0 = this file isn't tracked (yet)
+		if ( !chunk.m_hMD5RequestHandle )
+			continue;
+
+		m_treeMappedChunksHashed.Insert( chunk );
+		m_MappedHashesPending.AddToTail( chunk );
+	}
+}
+#endif
+
 void CPackedStore::GetPackFileLoadErrorSummary( CUtlString &sErrors )
 {
 	FOR_EACH_LL( m_PackedStoreReadCache.m_listCachedVPKReadsFailed, i )
@@ -1193,13 +1423,26 @@ int CPackedStore::ReadData( CPackedStoreFileHandle &handle, void *pOutData, int 
 			FileHandleTracker_t &fHandle = GetFileHandle( handle.m_nFileNumber );
 			int nDesiredPos = handle.m_nFileOffset + handle.m_nCurrentFileOffset - handle.m_nMetaDataSize;
 
-			AUTO_LOCK(fHandle.m_Mutex);
-
 			if ( handle.m_nFileNumber == VPKFILENUMBER_EMBEDDED_IN_DIR_FILE )
 			{
 				// for file data in the directory header, all offsets are relative to the size of the dir header.
 				nDesiredPos += m_nDirectoryDataSize + sizeof( VPKDirHeader_t );
 			}
+
+#ifdef VPK_MAPPED_READS
+			// No lock needed, nothing moves the file pointer
+			if ( fHandle.m_pMapped && nDesiredPos >= 0 && (int64)nDesiredPos + nNumBytes <= fHandle.m_nMappedSize &&
+				CopyFromMapping( pOutData, fHandle.m_pMapped + nDesiredPos, nNumBytes ) )
+			{
+				m_PackedStoreReadCache.NoteMappedRead( fHandle, handle.m_nFileNumber, nDesiredPos, nNumBytes );
+				handle.m_nCurrentFileOffset += nNumBytes;
+				nRet += nNumBytes;
+				m_PackedStoreReadCache.RetryAllBadCacheLines();
+				return nRet;
+			}
+#endif
+
+			AUTO_LOCK(fHandle.m_Mutex);
 
 			int nRead;
 			if ( m_PackedStoreReadCache.BCanSatisfyFromReadCache( (uint8 *)pOutData, handle, fHandle, nDesiredPos, nNumBytes, nRead ) )
@@ -1472,6 +1715,9 @@ FileHandleTracker_t & CPackedStore::GetFileHandle( int nFileNumber )
 			
 		if ( handle.m_hFileHandle != INVALID_HANDLE_VALUE )
 		{
+#ifdef VPK_MAPPED_READS
+			handle.m_pMapped = MapArchive( handle.m_hFileHandle, handle.m_nMappedSize );
+#endif
 			handle.m_nFileNumber = nFileNumber;
 		}
 #else
@@ -1924,6 +2170,63 @@ void CPackedStore::BuildFindFirstCache()
 
 		pList->CopyAndAddToTail( V_UnqualifiedFileName( allVPKFiles[i] ) );
 	}
+
+	// GMod
+	m_SortedDirs.clear();
+	m_bSortedDirsUsable = true;
+	m_SortedDirs.reserve( m_directoryList.Count() );
+	FOR_EACH_VEC( m_directoryList, i )
+	{
+		std::string lower( m_directoryList[i] );
+		for ( char &c : lower )
+		{
+			if ( (unsigned char)c >= 0x80 )
+				m_bSortedDirsUsable = false;
+			else if ( c >= 'A' && c <= 'Z' )
+				c += 'a' - 'A';
+		}
+		m_SortedDirs.emplace_back( std::move( lower ), i );
+	}
+
+	if ( m_bSortedDirsUsable )
+		std::sort( m_SortedDirs.begin(), m_SortedDirs.end() );
+	else
+		m_SortedDirs.clear();
+}
+
+// Indexes into m_directoryList, ascending, of the folders equal to pszLower or (bPrefix) starting with it
+bool CPackedStore::SortedDirIndexes( const char *pszLower, bool bPrefix, CUtlVector<intp> &out ) const
+{
+	if ( !m_bSortedDirsUsable )
+		return false;
+
+	const std::string_view key( pszLower );
+	auto it = std::lower_bound( m_SortedDirs.begin(), m_SortedDirs.end(), key, []( const std::pair<std::string, intp> &e, std::string_view k ) { return std::string_view( e.first ) < k; } );
+	for ( ; it != m_SortedDirs.end(); ++it )
+	{
+		const std::string &dir = it->first;
+		if ( bPrefix ? dir.compare( 0, key.size(), key ) != 0 : dir != key )
+			break;
+		out.AddToTail( it->second );
+	}
+
+	std::sort( out.Base(), out.Base() + out.Count() );
+	return true;
+}
+
+// Lowercase copy, false if it has anything V_strnicmp would compare by locale
+static bool LowerAsciiPath( const char *pszIn, char *pszOut, size_t nOutSize )
+{
+	size_t i = 0;
+	for ( ; pszIn[i]; ++i )
+	{
+		if ( i + 1 >= nOutSize || (unsigned char)pszIn[i] >= 0x80 )
+			return false;
+		char c = pszIn[i];
+		pszOut[i] = ( c >= 'A' && c <= 'Z' ) ? (char)( c + 'a' - 'A' ) : c;
+	}
+	pszOut[i] = '\0';
+	return true;
 }
 
 // GMod
@@ -2005,11 +2308,20 @@ intp CPackedStore::GetFileAndDirLists( const char *pWildCard, CUtlStringList &ou
 		// Generate the list of directories and files that match the wildcard
 		//
 
+		// GMod: only the folders the loops below can match, in the same order
+		char szLowerPath[MAX_PATH];
+		CUtlVector<intp> dirCandidates;
+		const bool bDirIndexed = nLenWildcardPath && LowerAsciiPath( szWildCardPath, szLowerPath, sizeof( szLowerPath ) ) &&
+			SortedDirIndexes( szLowerPath, true, dirCandidates );
+
 		//
 		// Directories first
 		//
-		FOR_EACH_VEC( m_directoryList, i )
+		const intp nDirLoop = bDirIndexed ? dirCandidates.Count() : m_directoryList.Count();
+		for ( intp k = 0; k < nDirLoop; ++k )
 		{
+			const intp i = bDirIndexed ? dirCandidates[k] : k;
+
 			// Does this file's path match the wildcard path?
 			if  (  (  nLenWildcardPath && ( 0 == V_strnicmp( m_directoryList[i], szWildCardPath, nLenWildcardPath ) ) ) 
 				|| ( !nLenWildcardPath && ( 0 == V_strlen( m_directoryList[i] ) ) ) )
@@ -2072,8 +2384,21 @@ intp CPackedStore::GetFileAndDirLists( const char *pWildCard, CUtlStringList &ou
 		//
 		// Files
 		//
-		FOR_EACH_VEC( m_directoryList, i )
+		Q_StripTrailingSlash( szWildCardPath );
+		CUtlVector<intp> fileCandidates;
+		const bool bFileIndexed = LowerAsciiPath( szWildCardPath, szLowerPath, sizeof( szLowerPath ) ) &&
+			SortedDirIndexes( szLowerPath, false, fileCandidates );
+
+		// GMod: names already added, sorted. Everything starting with a name sits right after it
+		std::set<std::string> addedFiles;
+		FOR_EACH_VEC( outFilenames, j )
+			addedFiles.insert( outFilenames[j] );
+
+		const intp nFileLoop = bFileIndexed ? fileCandidates.Count() : m_directoryList.Count();
+		for ( intp k = 0; k < nFileLoop; ++k )
 		{
+			const intp i = bFileIndexed ? fileCandidates[k] : k;
+
 			// We no longer want the trailing slash
 			Q_StripTrailingSlash( szWildCardPath );
 
@@ -2106,20 +2431,15 @@ intp CPackedStore::GetFileAndDirLists( const char *pWildCard, CUtlStringList &ou
 					// Add the file to the output list
 					if ( matches )
 					{	
-						bool bFound = false;
-
-						FOR_EACH_VEC( outFilenames, j )
-						{
-							if ( !V_strncmp( outFilenames[j], filesInDirectory[iFile], V_strlen( filesInDirectory[iFile] ) ) )
-							{
-								bFound = true;
-								break;
-							}
-						}
+						// Same as V_strncmp( added, name, V_strlen( name ) ) == 0 for any added name
+						const std::string_view name( filesInDirectory[iFile] );
+						auto it = addedFiles.lower_bound( std::string( name ) );
+						const bool bFound = name.empty() ? !addedFiles.empty() : ( it != addedFiles.end() && it->compare( 0, name.size(), name ) == 0 );
 
 						if ( !bFound )
 						{
 							outFilenames.CopyAndAddToTail( filesInDirectory[iFile] );
+							addedFiles.emplace( name );
 						}
 					}
 				}

@@ -72,6 +72,14 @@
 #include "garrysmod/GamemodeSystem.h"
 #include "garrysmod/AddonFileSystem.h"
 #include <string>
+#include <vector>
+
+// Which search paths a FindFirst can get anything from, see CPathResolver
+struct CResolverFindFilter
+{
+	uint32 m_nSeq = 0;
+	std::vector<unsigned char> m_Flags; // by m_SearchPaths index
+};
 
 #include "tier0/memdbgon.h"
 
@@ -664,6 +672,11 @@ public:
 	};
 
 	friend class CSearchPathsIterator;
+	friend class CPathResolver;
+	friend class CSearchPathChangeScope;
+
+	// Search path index, see pathresolver.h
+	class CPathResolver *m_pPathResolver;
 
 	struct FindData_t
 	{
@@ -683,6 +696,9 @@ public:
 
 		// GMod
 		std::list<Addon::SearchFile> m_AddonSystemFiles;
+
+		bool m_bUseFilter = false;
+		CResolverFindFilter m_Filter;
 	};
 
 	friend class CSearchPath;

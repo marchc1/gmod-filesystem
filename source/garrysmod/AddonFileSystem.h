@@ -6,6 +6,7 @@
 #include "AddonFileHandle.h"
 #include <deque>
 #include <map>
+#include <string_view>
 
 namespace Addon
 {
@@ -34,8 +35,9 @@ struct SearchFile
 	bool		m_bFolder = false;
 };
 
-using Folder = std::map<std::string, Addon::FileInfo>;
-using Folders = std::map<std::string, Folder>;
+// std::less<> so we can look up with a string_view
+using Folder = std::map<std::string, Addon::FileInfo, std::less<>>;
+using Folders = std::map<std::string, Folder, std::less<>>;
 
 class FileSystem : public IAddonSystem
 {
@@ -84,6 +86,7 @@ public: // FileSystem
 	Addon::AddonType GetAddonType(SteamUGCDetails_t details);
 	void AddUGCFile(SteamUGCDetails_t details, Addon::AddonType type);
 	Folder* GetFolder( const std::string &strPath, bool bCreate = false );
+	void AddParentFolders( std::string strFolder, const std::string &strKey, FileHandle_t hFileHandle, uint64_t wsid );
 	void NormalizePath( std::string &strFileName );
 	void SendUGCListUpdate();
 	bool UnmountFile( std::string strFileName, const char *pszReason );
@@ -91,12 +94,15 @@ public: // FileSystem
 	std::string ResolveFile( std::string strRelativeFileName );
 	int64_t GetFileSize( std::string strRelativeFileName );
 	std::string ModPath() { return m_strModPath; };
+	const std::string &ModPathRef() const { return m_strModPath; }
+	bool HasFiles() const { return !m_Folders.empty(); }
 
-	FileInfo *GetFile( std::string strFileName );
-	FileHandle *GetFileEntry( std::string strFileName );
+	FileInfo *GetFile( std::string_view strFileName );
+	FileHandle *GetFileEntry( std::string_view strFileName );
 
 	void FindInAddon( const std::string &pPath, const std::string &pSearchPath, std::list<Addon::SearchFile> &results );
 	void FindFirst( const std::string &pPath, std::list<Addon::SearchFile> &results, FileHandle_t hFileHandle );
+	void FindFirstLiteral( const std::string &path, const std::string &strDir, std::list<Addon::SearchFile> &results, FileHandle_t hFileHandle );
 
 	bool IsDirectory( std::string strFolderName );
 

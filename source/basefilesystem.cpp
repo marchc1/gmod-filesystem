@@ -18,6 +18,8 @@
 #include "tier2/tier2.h"
 #include "zip_utils.h"
 #include "packfile.h"
+#include "foldercache.h"
+#include "pathresolver.h"
 
 #ifdef POSIX
 #include "linux_support.h"
@@ -282,6 +284,8 @@ CBaseFileSystem::CBaseFileSystem()
 	g_pBaseFileSystem = this;
 	g_pFullFileSystem = this;
 
+	m_pPathResolver = new CPathResolver( this );
+
 	m_WhitelistFileTrackingEnabled = -1;
 
 	// If this changes then FileNameHandleInternal_t/FileNameHandle_t needs to be fixed!!!
@@ -330,6 +334,9 @@ CBaseFileSystem::~CBaseFileSystem()
 
 	// Free the whitelist.
 	RegisterFileWhitelist( nullptr, nullptr );
+
+	delete m_pPathResolver;
+	m_pPathResolver = nullptr;
 }
 
 
@@ -387,6 +394,7 @@ void CBaseFileSystem::Shutdown()
 	// GMod
 	m_AddonFileSystem.Shutdown();
 
+	FolderCache::Shutdown();
 	ShutdownAsync();
 	m_FileTracker2.ShutdownAsync();
 
@@ -724,6 +732,8 @@ CPackedStoreRefCount::CPackedStoreRefCount( char const *pFileBasename, char *psz
 
 void CBaseFileSystem::AddVPKFile( char const *pPath, const char *pPathID, SearchPathAdd_t addType )
 {
+	CSearchPathChangeScope changeScope( *m_pPathResolver );
+
 #if defined( SUPPORT_PACKED_STORE )
 	char nameBuf[MAX_PATH];
 
@@ -759,6 +769,9 @@ void CBaseFileSystem::AddVPKFile( char const *pPath, const char *pPathID, Search
 			return;
 		}
 		pVPK->RegisterFileTracker( (IThreadedFileMD5Processor *)&m_FileTracker2 );
+#ifdef VPK_MAPPED_READS
+		pVPK->RegisterTrackedVPKFileCount( m_FileTracker2.TrackedVPKFileCountPtr() );
+#endif
 
 		pVPK->m_PackFileID = m_FileTracker2.NotePackFileOpened( pVPK->FullPathName(), pPathID, 0 );
 	}
@@ -782,6 +795,8 @@ void CBaseFileSystem::AddVPKFile( char const *pPath, const char *pPathID, Search
 
 bool CBaseFileSystem::RemoveVPKFile( const char *pPath, const char *pPathID )
 {
+	CSearchPathChangeScope changeScope( *m_pPathResolver );
+
 #if defined( SUPPORT_PACKED_STORE )
 	char nameBuf[MAX_PATH];
 
@@ -828,6 +843,8 @@ bool CBaseFileSystem::AddPackFile( const char *pFileName, const char *pathID )
 //-----------------------------------------------------------------------------
 bool CBaseFileSystem::AddPackFileFromPath( const char *pPath, const char *pakfile, bool bCheckForAppendedPack, const char *pathID )
 {
+	CSearchPathChangeScope changeScope( *m_pPathResolver );
+
 	char fullpath[ MAX_PATH ];
 	V_sprintf_safe( fullpath, "%s%s", pPath, pakfile );
 	Q_FixSlashes( fullpath );
@@ -886,6 +903,8 @@ bool CBaseFileSystem::AddPackFileFromPath( const char *pPath, const char *pakfil
 
 void CBaseFileSystem::AddPackFiles( const char *pPath, const CUtlSymbol &pathID, SearchPathAdd_t addType )
 {
+	CSearchPathChangeScope changeScope( *m_pPathResolver );
+
 	Assert( ThreadInMainThread() );
 	DISK_INTENSIVE();
 
@@ -1006,6 +1025,8 @@ void CBaseFileSystem::AddPackFiles( const char *pPath, const CUtlSymbol &pathID,
 //-----------------------------------------------------------------------------
 void CBaseFileSystem::RemoveAllMapSearchPaths( void )
 {
+	CSearchPathChangeScope changeScope( *m_pPathResolver );
+
 	AsyncFinishAll();
 
 	for ( auto i = m_SearchPaths.Head(); i != m_SearchPaths.InvalidIndex(); )
@@ -1024,6 +1045,8 @@ void CBaseFileSystem::RemoveAllMapSearchPaths( void )
 //-----------------------------------------------------------------------------
 void CBaseFileSystem::AddMapPackFile( const char *pPath, const char *pPathID, SearchPathAdd_t addType )
 {
+	CSearchPathChangeScope changeScope( *m_pPathResolver );
+
 	// RaphaelIT7:
 	// BUG! Even if we already added a .bsp
 	// GMod calls twice for some reason!
@@ -1348,6 +1371,8 @@ void CBaseFileSystem::PrintSearchPaths( void )
 //-----------------------------------------------------------------------------
 void CBaseFileSystem::AddSearchPathInternal( const char *pPath, const char *pathID, SearchPathAdd_t addType, bool bAddPackFiles )
 {
+	CSearchPathChangeScope changeScope( *m_pPathResolver );
+
 	AsyncFinishAll();
 
 	Assert( ThreadInMainThread() );
@@ -1386,6 +1411,8 @@ void CBaseFileSystem::AddSearchPathInternal( const char *pPath, const char *path
 		Q_strlower( newPath );
 #endif
 		AddSeperatorAndFixPath( newPath );
+
+		FolderCache::AddRoot( newPath );
 	}
 
 	// dimhotepus: As Raphael suggested, cache base path here.
@@ -1530,6 +1557,8 @@ int CBaseFileSystem::GetSearchPath( const char *pathID, bool bGetPackFiles, OUT_
 //-----------------------------------------------------------------------------
 bool CBaseFileSystem::RemoveSearchPath( const char *pPath, const char *pathID )
 {
+	CSearchPathChangeScope changeScope( *m_pPathResolver );
+
 	AsyncFinishAll();
 
 	char newPath[ MAX_FILEPATH ];
@@ -1583,6 +1612,8 @@ bool CBaseFileSystem::RemoveSearchPath( const char *pPath, const char *pathID )
 //-----------------------------------------------------------------------------
 void CBaseFileSystem::RemoveSearchPaths( const char *pathID )
 {
+	CSearchPathChangeScope changeScope( *m_pPathResolver );
+
 	AsyncFinishAll();
 
 	for( int i=m_SearchPaths.Head(); i != m_SearchPaths.InvalidIndex(); )
@@ -1983,6 +2014,8 @@ bool CBaseFileSystem::UnzipFile( const char *pFileName, const char *pPath, const
 //-----------------------------------------------------------------------------
 void CBaseFileSystem::RemoveAllSearchPaths( void )
 {
+	CSearchPathChangeScope changeScope( *m_pPathResolver );
+
 	AUTO_LOCK( m_SearchPathsMutex );
 	m_SearchPaths.Purge();
 }
@@ -2066,6 +2099,24 @@ public:
 
 		V_FixSlashes( m_AbsolutePath );
 	}
+
+	// SetAbsolutePath( "%s%s", a, b ) without the printf, truncates the same way
+	void SetAbsolutePathConcat( const char *pA, const char *pB )
+	{
+		constexpr size_t nMax = sizeof( m_AbsolutePath ) - 1;
+		size_t nLen = 0;
+		for ( const char *p : { pA, pB } )
+		{
+			size_t n = strlen( p );
+			if ( n > nMax - nLen )
+				n = nMax - nLen;
+			memcpy( m_AbsolutePath + nLen, p, n );
+			nLen += n;
+		}
+		m_AbsolutePath[nLen] = '\0';
+
+		V_FixSlashes( m_AbsolutePath );
+	}
 	
 	void SetResolvedFilename( const char *pStr )
 	{
@@ -2136,8 +2187,12 @@ void CBaseFileSystem::HandleOpenRegularFile( CFileOpenInfo &openInfo, bool bIsAb
 {
 	openInfo.m_pFileHandle = nullptr;
 
+	// Trace_FOpen does nothing when the open fails, so a known miss can skip it
+	const char *pOptions = openInfo.m_pOptions;
+	const bool bKnownMissing = pOptions[0] == 'r' && !strchr( pOptions, '+' ) && FolderCache::IsKnownMissing( openInfo.m_AbsolutePath );
+
 	int64 size;
-	FILE *fp = Trace_FOpen( openInfo.m_AbsolutePath, openInfo.m_pOptions, openInfo.m_Flags, &size );
+	FILE *fp = bKnownMissing ? nullptr : Trace_FOpen( openInfo.m_AbsolutePath, openInfo.m_pOptions, openInfo.m_Flags, &size );
 	if ( fp )
 	{
 		if ( m_pLogFile )
@@ -2236,11 +2291,17 @@ FileHandle_t CBaseFileSystem::FindFileInSearchPath( CFileOpenInfo &openInfo )
 	// Load loose file specified as relative filename
 	// Convert filename to lowercase.  All files in the
 	// game logical filesystem must be accessed by lowercase name
+	// V_strcpy_safe + V_strlower without strncpy zero filling all of MAX_PATH
 	char szLowercaseFilename[ MAX_PATH ];
-	V_strcpy_safe( szLowercaseFilename, openInfo.m_pFileName );
+	{
+		size_t n = 0;
+		for ( const char *p = openInfo.m_pFileName; *p && n < sizeof( szLowercaseFilename ) - 1; ++p )
+			szLowercaseFilename[n++] = *p;
+		szLowercaseFilename[n] = '\0';
+	}
 	V_strlower( szLowercaseFilename );
 
-	openInfo.SetAbsolutePath( "%s%s", openInfo.m_pSearchPath->GetPathString(), szLowercaseFilename );
+	openInfo.SetAbsolutePathConcat( openInfo.m_pSearchPath->GetPathString(), szLowercaseFilename );
 
 	// now have an absolute name
 	HandleOpenRegularFile( openInfo, false );
@@ -2375,6 +2436,57 @@ FileHandle_t CBaseFileSystem::OpenForRead( const char *pFileNameT, const char *p
 		// !FIXME! We probably need to deal with CRC tracking, right?
 
 		return (FileHandle_t)openInfo.m_pFileHandle;
+	}
+
+	// Only the search paths that could have it, in the same order the full walk would go
+	CPathResolver::Candidates candidates;
+	if ( m_pPathResolver->GetCandidates( pFileName, pathID, candidates ) )
+	{
+		bool bComplete = true;
+		for ( int i = 0; i < candidates.m_nCount; ++i )
+		{
+			alignas( CSearchPath ) unsigned char storage[sizeof( CSearchPath )];
+			CSearchPath *pSearchPath = m_pPathResolver->CopySearchPath( candidates, i, storage );
+			if ( !pSearchPath )
+			{
+				// Search paths changed under us
+				bComplete = false;
+				break;
+			}
+
+			openInfo.m_pSearchPath = pSearchPath;
+			FileHandle_t filehandle = FindFileInSearchPath( openInfo );
+			if ( filehandle )
+			{
+				if ( !pSearchPath->m_bIsTrustedForPureServer && openInfo.m_ePureFileClass == ePureServerFileClass_AnyTrusted )
+				{
+					m_FileTracker2.NoteFileIgnoredForPureServer( openInfo.m_pFileName, pathID, pSearchPath->m_storeId );
+					Close( filehandle );
+					openInfo.m_pFileHandle = nullptr;
+					if ( ppszResolvedFilename && *ppszResolvedFilename )
+					{
+						free( *ppszResolvedFilename );
+						*ppszResolvedFilename = nullptr;
+					}
+				}
+				else
+				{
+					openInfo.HandleFileCRCTracking( openInfo.m_pFileName );
+					CPathResolver::ReleaseSearchPath( pSearchPath );
+					return filehandle;
+				}
+			}
+
+			CPathResolver::ReleaseSearchPath( pSearchPath );
+		}
+
+		if ( bComplete )
+		{
+			LogFileOpen( "[Failed]", pFileName, "" );
+			return nullptr;
+		}
+
+		openInfo.m_pSearchPath = nullptr;
 	}
 
 	// Run through all the search paths.
@@ -3194,6 +3306,40 @@ long CBaseFileSystem::GetFileTime( const char *pFileName, const char *pPathID )
 
 	CHECK_DOUBLE_SLASHES( pFileName );
 
+	// Only the search paths that could have it, same order as the walk below
+	{
+		CPathResolver::Candidates candidates;
+		if ( m_pPathResolver->GetCandidates( pFileName, pPathID, candidates ) )
+		{
+			char tempFileName[MAX_PATH];
+			V_strcpy_safe( tempFileName, pFileName );
+			V_FixSlashes( tempFileName );
+#ifdef _WIN32
+			V_strlower( tempFileName );
+#endif
+
+			time_t result = 0L;
+			const bool bComplete = m_pPathResolver->Visit( candidates, FILTER_NONE, [&]( CSearchPath *pSearchPath ) {
+				time_t ft = FastFileTime( pSearchPath, tempFileName );
+				if ( ft == 0L )
+					return false;
+
+				if ( !pSearchPath->GetPackFile() && m_LogFuncs.Count() )
+				{
+					char pTmpFileName[ MAX_FILEPATH ];
+					V_sprintf_safe( pTmpFileName, "%s%s", pSearchPath->GetPathString(), tempFileName );
+					LogAccessToFile( "filetime", pTmpFileName, "" );
+				}
+
+				result = ft;
+				return true;
+			} );
+
+			if ( bComplete )
+				return result;
+		}
+	}
+
 	CSearchPathsIterator iter( this, &pFileName, pPathID );
 
 	char tempFileName[MAX_PATH];
@@ -3702,33 +3848,43 @@ bool CBaseFileSystem::IsDirectory( const char *pFileName, const char *pathID )
 		return false;
 	}
 
-	CSearchPathsIterator iter( this, &pFileName, pathID, FILTER_CULLPACK );
-	for ( CSearchPath *pSearchPath = iter.GetFirst(); pSearchPath != nullptr; pSearchPath = iter.GetNext() )
+	auto isDirectoryIn = [&]( CSearchPath *pSearchPath ) -> bool
 	{
 #ifdef SUPPORT_PACKED_STORE
 		if ( pSearchPath->GetPackedStore() )
 		{
 			// GMod
-			if ( pSearchPath->GetPackedStore()->DirectoryEntryExists( pFileName ) )
-				return true;
+			return pSearchPath->GetPackedStore()->DirectoryEntryExists( pFileName );
 		}
-		else
 #endif // SUPPORT_PACKED_STORE
+
+		char pTmpFileName[ MAX_FILEPATH ];
+		V_sprintf_safe( pTmpFileName, "%s%s", pSearchPath->GetPathString(), pFileName );
+		V_FixSlashes( pTmpFileName );
+
+		// GMod
+		if ( m_AddonFileSystem.IsDirectory( pTmpFileName ) )
+			return true;
+
+		return FS_stat( pTmpFileName, &buf ) != -1 && ( buf.st_mode & _S_IFDIR );
+	};
+
+	// Only the search paths that could have it
+	{
+		CPathResolver::Candidates candidates;
+		if ( m_pPathResolver->GetCandidates( pFileName, pathID, candidates, CPathResolver::Kind::Directory ) )
 		{
-			char pTmpFileName[ MAX_FILEPATH ];
-			V_sprintf_safe( pTmpFileName, "%s%s", pSearchPath->GetPathString(), pFileName );
-			V_FixSlashes( pTmpFileName );
-
-			// GMod
-			if ( m_AddonFileSystem.IsDirectory( pTmpFileName ) )
-				return true;
-
-			if ( FS_stat( pTmpFileName, &buf ) != -1 )
-			{
-				if ( buf.st_mode & _S_IFDIR )
-					return true;
-			}
+			bool bFound = false;
+			if ( m_pPathResolver->Visit( candidates, FILTER_CULLPACK, [&]( CSearchPath *pSearchPath ) { return bFound = isDirectoryIn( pSearchPath ); } ) )
+				return bFound;
 		}
+	}
+
+	CSearchPathsIterator iter( this, &pFileName, pathID, FILTER_CULLPACK );
+	for ( CSearchPath *pSearchPath = iter.GetFirst(); pSearchPath != nullptr; pSearchPath = iter.GetNext() )
+	{
+		if ( isDirectoryIn( pSearchPath ) )
+			return true;
 	}
 	return false;
 }
@@ -3773,7 +3929,10 @@ void CBaseFileSystem::CreateDirHierarchy( const char *pRelativePathT, const char
 			*s = '\0';
 
 #if defined( _WIN32 )
-			if ( _mkdir( szScratchFileName ) && errno != EEXIST )
+			const int nMkdirResult = _mkdir( szScratchFileName );
+			if ( nMkdirResult == 0 )
+				FolderCache::OnPathChanged( szScratchFileName );
+			if ( nMkdirResult && errno != EEXIST )
 #elif defined( POSIX )
 			if ( mkdir( szScratchFileName, S_IRWXU |  S_IRGRP |  S_IROTH ) && errno != EEXIST )// owner has rwx, rest have r
 #endif
@@ -3791,7 +3950,10 @@ void CBaseFileSystem::CreateDirHierarchy( const char *pRelativePathT, const char
 	}
 
 #if defined( _WIN32 )
-	if ( _mkdir( szScratchFileName ) && errno != EEXIST )
+	const int nMkdirResult = _mkdir( szScratchFileName );
+	if ( nMkdirResult == 0 )
+		FolderCache::OnPathChanged( szScratchFileName );
+	if ( nMkdirResult && errno != EEXIST )
 #elif defined( POSIX )
 	if ( mkdir( szScratchFileName, S_IRWXU |  S_IRGRP |  S_IROTH ) && errno != EEXIST )
 #endif
@@ -3817,6 +3979,15 @@ const char *CBaseFileSystem::FindFirstEx( const char *pWildCard, const char *pPa
 	return FindFirstHelper( pWildCard, pPathID, pHandle, nullptr );
 }
 
+
+static bool IsPackSearchPath( const CBaseFileSystem::CSearchPath *pSearchPath )
+{
+#ifdef SUPPORT_PACKED_STORE
+	if ( pSearchPath->GetPackedStore() )
+		return true;
+#endif
+	return pSearchPath->GetPackFile() != nullptr;
+}
 
 const char *CBaseFileSystem::FindFirstHelper( const char *pWildCardT, const char *pPathID, FileFindHandle_t *pHandle, int *pFoundStoreID )
 {
@@ -3849,6 +4020,9 @@ const char *CBaseFileSystem::FindFirstHelper( const char *pWildCardT, const char
 	}
 	else
 	{
+		// Skips search paths that can't have anything for this, the rest goes exactly like before
+		pFindData->m_bUseFilter = m_pPathResolver->GetFindFilter( pWildCard, pPathID, pFindData->m_Filter );
+
 		for(	pFindData->currentSearchPathID = m_SearchPaths.Head();
 				pFindData->currentSearchPathID != m_SearchPaths.InvalidIndex();
 				pFindData->currentSearchPathID = m_SearchPaths.Next( pFindData->currentSearchPathID ) )
@@ -3860,6 +4034,11 @@ const char *CBaseFileSystem::FindFirstHelper( const char *pWildCardT, const char
 
 			// already visited this path?
 			if ( pFindData->m_VisitedSearchPaths.MarkVisit( *pSearchPath ) )
+				continue;
+
+			// A pack that can't match still hands out the GMA results queued so far, the helper does that
+			const bool bCanMatch = !pFindData->m_bUseFilter || m_pPathResolver->FindFilterAllows( pFindData->m_Filter, pFindData->currentSearchPathID, CPathResolver::kFindMatches );
+			if ( !bCanMatch && ( !IsPackSearchPath( pSearchPath ) || pFindData->m_AddonSystemFiles.empty() ) )
 				continue;
 
 			// If this is a VPK or Pak file, build list of matches now and use helper
@@ -3877,7 +4056,8 @@ const char *CBaseFileSystem::FindFirstHelper( const char *pWildCardT, const char
 
 				Assert( pFindData->m_dirMatchesFromVPKOrPak.Count() == 0 );
 				Assert( pFindData->m_fileMatchesFromVPKOrPak.Count() == 0 );
-				pSearchPath->GetPackFile()->GetFileAndDirLists( pWildCard, pFindData->m_dirMatchesFromVPKOrPak, pFindData->m_fileMatchesFromVPKOrPak, true );
+				if ( bCanMatch )
+					pSearchPath->GetPackFile()->GetFileAndDirLists( pWildCard, pFindData->m_dirMatchesFromVPKOrPak, pFindData->m_fileMatchesFromVPKOrPak, true );
 				bIsVPKOrPak = true;
 			}
 
@@ -3886,11 +4066,13 @@ const char *CBaseFileSystem::FindFirstHelper( const char *pWildCardT, const char
 			{
 				Assert( pFindData->m_dirMatchesFromVPKOrPak.Count() == 0 );
 				Assert( pFindData->m_fileMatchesFromVPKOrPak.Count() == 0 );
-				pSearchPath->GetPackedStore()->GetFileAndDirLists( pWildCard, pFindData->m_dirMatchesFromVPKOrPak, pFindData->m_fileMatchesFromVPKOrPak, true );
+				if ( bCanMatch )
+					pSearchPath->GetPackedStore()->GetFileAndDirLists( pWildCard, pFindData->m_dirMatchesFromVPKOrPak, pFindData->m_fileMatchesFromVPKOrPak, true );
 				bIsVPKOrPak = true;
 			}
 #endif
 			// GMod
+			if ( !pFindData->m_bUseFilter || m_pPathResolver->FindFilterAllows( pFindData->m_Filter, pFindData->currentSearchPathID, CPathResolver::kFindGma ) )
 			{
 				char pTmpFileName[ MAX_FILEPATH ];
 				V_sprintf_safe( pTmpFileName, "%s%s", pSearchPath->GetPathString(), pFindData->wildCardString.Base() );
@@ -3923,9 +4105,14 @@ const char *CBaseFileSystem::FindFirstHelper( const char *pWildCardT, const char
 
 		// GMod
 		// RaphaelIT7: Since the above code may break out when having found something, we must iterate down here too!
-		FOR_EACH_LL_( m_SearchPaths, pSearchPath )
+		for ( auto i = m_SearchPaths.Head(); i != m_SearchPaths.InvalidIndex(); i = m_SearchPaths.Next( i ) )
 		{
+			CSearchPath *pSearchPath = &m_SearchPaths[i];
 			if ( FilterByPathID( pSearchPath, pFindData->m_FilterPathID ) )
+				continue;
+
+			// Only folders on the mod path's line can match a GMA
+			if ( pFindData->m_bUseFilter && !m_pPathResolver->FindFilterAllows( pFindData->m_Filter, i, CPathResolver::kFindGma ) )
 				continue;
 
 			char pTmpFileName[ MAX_FILEPATH ];
@@ -4022,6 +4209,10 @@ bool CBaseFileSystem::FindNextFileHelper( FindData_t *pFindData, int *pFoundStor
 		if ( pFindData->m_VisitedSearchPaths.MarkVisit( *pSearchPath ) )
 			continue;
 
+		const bool bCanMatch = !pFindData->m_bUseFilter || m_pPathResolver->FindFilterAllows( pFindData->m_Filter, pFindData->currentSearchPathID, CPathResolver::kFindMatches );
+		if ( !bCanMatch && ( !IsPackSearchPath( pSearchPath ) || pFindData->m_AddonSystemFiles.empty() ) )
+			continue;
+
 		if ( pSearchPath->GetPackFile() )
 		{
 			// XXX(johns) This support didn't exist for a long time, and I'm now worried about various things
@@ -4034,7 +4225,8 @@ bool CBaseFileSystem::FindNextFileHelper( FindData_t *pFindData, int *pFoundStor
 			}
 			Assert( pFindData->m_dirMatchesFromVPKOrPak.Count() == 0 );
 			Assert( pFindData->m_fileMatchesFromVPKOrPak.Count() == 0 );
-			pSearchPath->GetPackFile()->GetFileAndDirLists( pFindData->wildCardString.Base(), pFindData->m_dirMatchesFromVPKOrPak, pFindData->m_fileMatchesFromVPKOrPak, true );
+			if ( bCanMatch )
+				pSearchPath->GetPackFile()->GetFileAndDirLists( pFindData->wildCardString.Base(), pFindData->m_dirMatchesFromVPKOrPak, pFindData->m_fileMatchesFromVPKOrPak, true );
 			if ( FindNextFileInVPKOrPakHelper( pFindData ) )
 				return true;
 			continue;
@@ -4045,7 +4237,8 @@ bool CBaseFileSystem::FindNextFileHelper( FindData_t *pFindData, int *pFoundStor
 			{
 				Assert( pFindData->m_dirMatchesFromVPKOrPak.Count() == 0 );
 				Assert( pFindData->m_fileMatchesFromVPKOrPak.Count() == 0 );
-				pSearchPath->GetPackedStore()->GetFileAndDirLists( pFindData->wildCardString.Base(), pFindData->m_dirMatchesFromVPKOrPak, pFindData->m_fileMatchesFromVPKOrPak, true );
+				if ( bCanMatch )
+					pSearchPath->GetPackedStore()->GetFileAndDirLists( pFindData->wildCardString.Base(), pFindData->m_dirMatchesFromVPKOrPak, pFindData->m_fileMatchesFromVPKOrPak, true );
 				if ( FindNextFileInVPKOrPakHelper( pFindData ) )
 					return true;
 				continue;
@@ -4195,9 +4388,25 @@ bool CBaseFileSystem::FixUpPath( const char *pFileName, OUT_Z_CAP(sizeFixedUpFil
 {
 	//  If appropriate fixes up the filename to ensure that it's handled properly by the system.
 	//
-	V_strncpy( pFixedUpFileName, pFileName, sizeFixedUpFileName );
-	V_FixSlashes( pFixedUpFileName, CORRECT_PATH_SEPARATOR );
-	V_FixDoubleSlashes( pFixedUpFileName );
+	// Same as V_strncpy + V_FixSlashes + V_FixDoubleSlashes in one pass.
+	// V_FixDoubleSlashes skips index 0, so only pairs after that count
+	bool bHasDoubleSlash = false;
+	int i = 0;
+	for ( const int nMax = sizeFixedUpFileName - 1; i < nMax && pFileName[i]; ++i )
+	{
+		char c = pFileName[i];
+		if ( c == INCORRECT_PATH_SEPARATOR )
+			c = CORRECT_PATH_SEPARATOR;
+
+		if ( c == CORRECT_PATH_SEPARATOR && i >= 2 && pFixedUpFileName[i - 1] == CORRECT_PATH_SEPARATOR )
+			bHasDoubleSlash = true;
+
+		pFixedUpFileName[i] = c;
+	}
+	pFixedUpFileName[i] = '\0';
+
+	if ( bHasDoubleSlash )
+		V_FixDoubleSlashes( pFixedUpFileName );
 
 	if ( !V_IsAbsolutePath( pFixedUpFileName ) )
 	{
@@ -4270,8 +4479,8 @@ const char *CBaseFileSystem::RelativePathToFullPath( const char *pFileName, cons
 //	}
 	
 
-	CSearchPathsIterator iter( this, &pFileName, pPathID, pathFilter );
-	for ( CSearchPath *pSearchPath = iter.GetFirst(); pSearchPath != nullptr; pSearchPath = iter.GetNext() )
+	// 0 = not in this one, 1 = found it (pDest), 2 = give up (nullptr)
+	auto tryPath = [&]( CSearchPath *pSearchPath ) -> int
 	{
 		CPackFile *pPack = pSearchPath->GetPackFile();
 		if ( pPack )
@@ -4303,17 +4512,17 @@ const char *CBaseFileSystem::RelativePathToFullPath( const char *pFileName, cons
 					::Warning( "File %s was found in %s, but resulting abs filename won't fit in callers buffer of %d bytes\n",
 						pFileName, pszPackName, maxLenInChars );
 					Assert( false );
-					return nullptr;
+					return 2;
 				}
 
 				V_strncpy( pDest, pszPackName, maxLenInChars );
 				V_AppendSlash( pDest, maxLenInChars );
 				V_strncat( pDest, pFileName, maxLenInChars ); 
 				Assert( V_strlen( pDest ) == nTotalLen );
-				return pDest;
+				return 1;
 			}
 
-			continue;
+			return 0;
 		}
 
 		// Found in VPK?
@@ -4334,16 +4543,16 @@ const char *CBaseFileSystem::RelativePathToFullPath( const char *pFileName, cons
 						::Warning( "File %s was found in %s, but resulting abs filename won't fit in callers buffer of %d bytes\n",
 							pFileName, pszVpkName, maxLenInChars );
 						Assert( false );
-						return nullptr;
+						return 2;
 					}
 
 					V_strncpy( pDest, pszVpkName, maxLenInChars );
 					V_AppendSlash( pDest, maxLenInChars );
 					V_strncat( pDest, pFileName, maxLenInChars );
 					V_FixSlashes( pDest );
-					return pDest;
+					return 1;
 				}
-				continue;
+				return 0;
 			}
 #endif
 
@@ -4357,7 +4566,7 @@ const char *CBaseFileSystem::RelativePathToFullPath( const char *pFileName, cons
 			if ( !strFullFileName.empty() )
 			{
 				V_strncpy( pDest, strFullFileName.c_str(), maxLenInChars );
-				return pDest;
+				return 1;
 			}
 		}
 
@@ -4368,8 +4577,28 @@ const char *CBaseFileSystem::RelativePathToFullPath( const char *pFileName, cons
 			{
 				*pPathType |= PATH_IS_REMOTE;
 			}
-			return pDest;
+			return 1;
 		}
+		return 0;
+	};
+
+	// Only the search paths that could have it
+	{
+		CPathResolver::Candidates candidates;
+		if ( m_pPathResolver->GetCandidates( pFileName, pPathID, candidates ) )
+		{
+			int result = 0;
+			if ( m_pPathResolver->Visit( candidates, pathFilter, [&]( CSearchPath *pSearchPath ) { return ( result = tryPath( pSearchPath ) ) != 0; } ) )
+				return result == 1 ? pDest : nullptr;
+		}
+	}
+
+	CSearchPathsIterator iter( this, &pFileName, pPathID, pathFilter );
+	for ( CSearchPath *pSearchPath = iter.GetFirst(); pSearchPath != nullptr; pSearchPath = iter.GetNext() )
+	{
+		const int result = tryPath( pSearchPath );
+		if ( result )
+			return result == 1 ? pDest : nullptr;
 	}
 
 	// not found
@@ -4475,11 +4704,15 @@ void CBaseFileSystem::RemoveFile( char const* pRelativePath, const char *pathID 
 		ComputeFullWritePath( szScratchFileName, sizeof( szScratchFileName ), pRelativePath, pathID );
 	}
 
-	if ( unlink( szScratchFileName ) )
+	const int nUnlinkResult = unlink( szScratchFileName );
+	const int nUnlinkErrno = errno;
+	FolderCache::OnPathChanged( szScratchFileName );
+
+	if ( nUnlinkResult )
 	{
 		Warning( FILESYSTEM_WARNING, "Unable to remove file '%s': %s.\n",
 			szScratchFileName,
-			std::generic_category().message(errno).c_str() );
+			std::generic_category().message(nUnlinkErrno).c_str() );
 	}
 }
 
@@ -4535,7 +4768,13 @@ bool CBaseFileSystem::RenameFile( char const *pOldPath, char const *pNewPath, co
 	CreateDirHierarchy( pPathOnly, pathID );
 
 	// Now copy the file over.
-	if ( rename( szScratchFileName, pNewFileName ) )
+	const int nRenameResult = rename( szScratchFileName, pNewFileName );
+	const int nRenameErrno = errno;
+	FolderCache::OnPathChanged( szScratchFileName );
+	FolderCache::OnPathChanged( pNewFileName );
+	errno = nRenameErrno;
+
+	if ( nRenameResult )
 	{
 		::Warning( "Unable to rename file '%s' to '%s': %s.\n",
 			szScratchFileName,
@@ -4974,6 +5213,8 @@ CBaseFileSystem::CPathIDInfo* CBaseFileSystem::FindOrAddPathIDInfo( const CUtlSy
 
 void CBaseFileSystem::MarkPathIDByRequestOnly( const char *pPathID, bool bRequestOnly )
 {
+	CSearchPathChangeScope changeScope( *m_pPathResolver );
+
 	FindOrAddPathIDInfo( g_PathIDTable.AddString( pPathID ), bRequestOnly );
 }
 
@@ -5663,6 +5904,8 @@ CBaseFileSystem::CFileCacheObject::~CFileCacheObject()
 
 CBaseFileSystem::CSearchPath* CBaseFileSystem::NewSearchPath( SearchPathAdd_t addType )
 {
+	CSearchPathChangeScope changeScope( *m_pPathResolver );
+
 	// bit 0 = SearchPathAdd_t (head/tail)
 	// bit 1-7+ = CPathPriorityGroup_t priority group
 	// bit 8 = VPK hack flag?
@@ -5706,6 +5949,8 @@ CBaseFileSystem::CSearchPath* CBaseFileSystem::NewSearchPath( SearchPathAdd_t ad
 
 void CBaseFileSystem::RemoveSearchPathsByGroup( int iPriorityGroup )
 {
+	CSearchPathChangeScope changeScope( *m_pPathResolver );
+
 	AsyncFinishAll();
 
 	iPriorityGroup >>= 1; // RaphaelIT7: IDA shows if (iPriorityGroup >> 1 == pSearchPath->m_PriorityGroupID)
@@ -5906,8 +6151,14 @@ void CBaseFileSystem::GMOD_SetupDefaultPaths( const char *pszGamePath, const cha
 	//
 	// Engine
 	//
+#ifdef PLATFORM_64BITS
+	// x64 GMod: the 64 bit client/server dlls live in bin/win64, bin/ has the 32 bit ones.
+	// Stock x64 doesn't add EXECUTABLE_PATH here either
+	AddSearchPath( ( m_strModPath + "/bin/win64" ).c_str(), "GAMEBIN", PRIORITY_GROUP_TAIL( GN_ENGINECORE ) );
+#else
 	AddSearchPath( ( m_strModPath + "/bin" ).c_str(), "GAMEBIN", PRIORITY_GROUP_TAIL( GN_ENGINECORE ) );
 	AddSearchPath( ( m_strGamePath ).c_str(), "EXECUTABLE_PATH", PRIORITY_GROUP_TAIL( GN_ENGINECORE ) );
+#endif
 
 	//
 	// Workshop

@@ -11,12 +11,14 @@ Addon::Reader::Reader( uint64_t wsid )
 // RaphaelIT7:
 // With Extracted it means that they quite literally will be written onto disk.
 // So you better be very sure that they are safe.
+bool globber( const char *wild, const char *string );
+
 bool Addon::Reader::ShouldBeExtracted( const std::string &strFileName )
 {
-	if ( Bootil::String::Test::Wildcard( "resource/fonts/*.ttf", strFileName ) )
+	if ( globber( "resource/fonts/*.ttf", strFileName.c_str() ) )
 		return true;
 
-	if ( Bootil::String::Test::Wildcard( "gamemodes/*/content/resource/fonts/*.ttf", strFileName ) )
+	if ( globber( "gamemodes/*/content/resource/fonts/*.ttf", strFileName.c_str() ) )
 		return true;
 
 	return false;
@@ -61,20 +63,61 @@ bool Addon::Reader::OpenFile( const std::string &strFileName )
 	// Though also then- this is only the minimum size.
 	// I wonder, if GMod has to read a 2GB addon, will it resize down?
 	buffer.EnsureCapacity( 0xA00000u );
-	buffer.SetWritten( ( buffer.GetSize() >= m_nAddonSize ) ? m_nAddonSize : buffer.GetSize() );
+	const unsigned int nFull = ( buffer.GetSize() >= m_nAddonSize ) ? m_nAddonSize : buffer.GetSize();
+
+	// The header and file list are at the start, usually well under this.
+	// Every read past what was read in fails a bounds check, so a parse that works here reads the
+	// same bytes the full read would. Anything else is parsed again from the full read
+	constexpr unsigned int nFirstChunk = 256 * 1024;
+	const unsigned int nChunk = nFull > nFirstChunk ? nFirstChunk : nFull;
+
+	buffer.SetWritten( nChunk );
 	buffer.SetPos( 0 );
+	g_pFullFileSystem->Read( buffer.GetBase(), nChunk, hFileHandle );
 
-	g_pFullFileSystem->Read( buffer.GetBase(), buffer.GetWritten(), hFileHandle );
+	if ( nChunk < nFull )
+	{
+		m_bQuiet = true;
+		const bool bParsed = ParseHeader( hFileHandle, buffer );
+		m_bQuiet = false;
+		if ( bParsed )
+			return true;
 
+		ResetParse();
+		g_pFullFileSystem->Read( (char *)buffer.GetBase() + nChunk, nFull - nChunk, hFileHandle );
+		buffer.SetWritten( nFull );
+		buffer.SetPos( 0 );
+	}
+
+	return ParseHeader( hFileHandle, buffer );
+}
+
+bool Addon::Reader::ParseHeader( FileHandle_t hFileHandle, Bootil::Buffer &buffer )
+{
 	Addon::Header header = buffer.ReadType<Addon::Header>();
 	if ( header.Ident[0] != 'G' || header.Ident[1] != 'M' || header.Ident[2] != 'A' || header.Ident[3] != 'D' )
 	{
-		Warning( "Not loading addon '%s' - addon header invalid\n", m_strFileName.c_str() );
+		if ( !m_bQuiet )
+			Warning( "Not loading addon '%s' - addon header invalid\n", m_strFileName.c_str() );
 		return false;
 	}
 
 	m_nGMAVersion = header.Version;
 	return ReadAddonFile( hFileHandle, buffer );
+}
+
+void Addon::Reader::ResetParse()
+{
+	m_nGMAVersion = 0;
+	m_bBadAddon = false;
+	m_nSteamID = 0;
+	m_nTimestamp = 0;
+	m_nContentsOffset = 0;
+	m_strAddonTitle.clear();
+	m_strAddonDesc.clear();
+	m_strAddonAuthor.clear();
+	m_nAddonVersion = 0;
+	m_Files.clear();
 }
 
 // RaphaelIT7:
@@ -94,7 +137,8 @@ bool Addon::Reader::ReadAddonFile( FileHandle_t hFileHandle, Bootil::Buffer &buf
 	{
 		if ( !ReadRequiredContent( buffer ) )
 		{
-			Warning( "Not loading addon '%s' - couldn't read required addons!\n", m_strFileName.c_str() );
+			if ( !m_bQuiet )
+				Warning( "Not loading addon '%s' - couldn't read required addons!\n", m_strFileName.c_str() );
 			return false;
 		}
 	}
@@ -150,7 +194,8 @@ bool Addon::Reader::ReadFileEntry( Bootil::Buffer &buffer )
 {
 	if ( buffer.GetWritten() <= buffer.GetPos() + sizeof( uint32_t ) )
 	{
-		Warning( "Not loading addon '%s', failed to parse addon file list!\n", m_strFileName.c_str() );
+		if ( !m_bQuiet )
+			Warning( "Not loading addon '%s', failed to parse addon file list!\n", m_strFileName.c_str() );
 		m_bBadAddon = true;
 		return false;
 	}
@@ -161,7 +206,8 @@ bool Addon::Reader::ReadFileEntry( Bootil::Buffer &buffer )
 
 	if ( buffer.GetWritten() <= buffer.GetPos() + 1 )
 	{
-		Warning( "Not loading addon '%s', failed to parse addon file list!\n", m_strFileName.c_str() );
+		if ( !m_bQuiet )
+			Warning( "Not loading addon '%s', failed to parse addon file list!\n", m_strFileName.c_str() );
 		m_bBadAddon = true;
 		return false;
 	}
@@ -169,7 +215,8 @@ bool Addon::Reader::ReadFileEntry( Bootil::Buffer &buffer )
 	std::string strFileName = buffer.ReadString();
 	if ( buffer.GetWritten() <= buffer.GetPos() + sizeof( uint64_t ) + sizeof( uint32_t ) )
 	{
-		Warning( "Not loading addon '%s', failed to parse addon file list!\n", m_strFileName.c_str() );
+		if ( !m_bQuiet )
+			Warning( "Not loading addon '%s', failed to parse addon file list!\n", m_strFileName.c_str() );
 		m_bBadAddon = true;
 		return false;
 	}
@@ -181,7 +228,8 @@ bool Addon::Reader::ReadFileEntry( Bootil::Buffer &buffer )
 	std::string error = Addon::WhiteList::FilenameErrors( strFileName, iSize );
 	if ( !error.empty() )
 	{
-		Warning( "Not loading addon '%s' - %s\n", m_strFileName.c_str(), error.c_str() );
+		if ( !m_bQuiet )
+			Warning( "Not loading addon '%s' - %s\n", m_strFileName.c_str(), error.c_str() );
 		m_bBadAddon = true;
 		return false;
 	}
@@ -190,7 +238,8 @@ bool Addon::Reader::ReadFileEntry( Bootil::Buffer &buffer )
 
 	if ( iSize > 2000000000 )
 	{
-		Warning("Not loading addon '%s' - %s is too large! (%s)\n", m_strFileName.c_str(), m_strFileName.c_str(), Bootil::String::Format::Memory( iSize ).c_str() );
+		if ( !m_bQuiet )
+			Warning("Not loading addon '%s' - %s is too large! (%s)\n", m_strFileName.c_str(), m_strFileName.c_str(), Bootil::String::Format::Memory( iSize ).c_str() );
 		m_bBadAddon = true;
 		return false;
 	}
@@ -210,6 +259,9 @@ void Addon::Reader::ExtractFiles()
 {
 	for ( auto &fileEntry : m_Files )
 	{
+		if ( !ShouldBeExtracted( fileEntry.strName ) )
+			continue;
+
 		std::string strOutputPath = "cache/workshop/" + fileEntry.strName;
 		if ( Bootil::String::Test::StartsWith( fileEntry.strName, "gamemodes/" ) )
 		{
@@ -220,9 +272,6 @@ void Addon::Reader::ExtractFiles()
 				strOutputPath = "cache/workshop/" + fileEntry.strName.substr( firstSlash + 9 );
 			}
 		}
-
-		if ( !ShouldBeExtracted( fileEntry.strName ) )
-			continue;
 
 		bool bExistsInMod = g_pFullFileSystem->FileExists( strOutputPath.c_str(), "MOD" );
 		if ( bExistsInMod == g_pFullFileSystem->FileExists( fileEntry.strName.c_str(), "workshop" ) )
@@ -257,7 +306,8 @@ bool Addon::Reader::BuildOffsets()
 
 		if ( iContentOffset > m_nAddonSize )
 		{
-			Warning( "Not loading addon '%s' - Malformed .gma file\n", m_strFileName.c_str() );
+			if ( !m_bQuiet )
+				Warning( "Not loading addon '%s' - Malformed .gma file\n", m_strFileName.c_str() );
 
 			m_bBadAddon = true;
 			return false;
@@ -265,7 +315,8 @@ bool Addon::Reader::BuildOffsets()
 
 		if ( iContentOffset > 0xFFFFFFFFULL )
 		{
-			Warning( "Not loading addon '%s' - file size too large (above 4GB)\n", m_strFileName.c_str() );
+			if ( !m_bQuiet )
+				Warning( "Not loading addon '%s' - file size too large (above 4GB)\n", m_strFileName.c_str() );
 			m_bBadAddon = true;
 			return false;
 		}

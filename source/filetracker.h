@@ -153,6 +153,9 @@ public:
 	virtual bool BlockUntilMD5RequestComplete( int iRequest, MD5Value_t *pMd5ValueOut );
 	virtual bool IsMD5RequestComplete( int iRequest, MD5Value_t *pMd5ValueOut );
 
+	// Lets mapped VPK reads skip the MD5 bookkeeping when nobody asked for hashes
+	const size_t *TrackedVPKFileCountPtr() const { return &m_cComputedMD5ForVPKFiles; }
+
 	int NotePackFileOpened( const char *pVPKAbsPath, const char *pPathID, int64 nLength );
 	void NotePackFileAccess( const char *pFilename, const char *pPathID, int iSearchPathStoreId, CPackedStoreFileHandle &VPKHandle );
 	void AddFileHashForVPKFile( int nPackFileNumber, int nFileFraction, int cbFileLen, MD5Value_t &md5, CPackedStoreFileHandle &fhandle );

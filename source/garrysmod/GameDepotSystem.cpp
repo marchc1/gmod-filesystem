@@ -287,7 +287,7 @@ const char* GameDepot::DoMountDir( IGameDepotSystem::Information& info, const st
 	// TODO: developer convar test I think
 	Msg( "MountableGame looking in '%s'...\n", findPattern.c_str() );
 
-	int findHandle = 0;
+	FileFindHandle_t findHandle = 0;
 	const char* pFileName = g_pFullFileSystem->FindFirst( findPattern.c_str(), &findHandle );
 
 	while (pFileName)

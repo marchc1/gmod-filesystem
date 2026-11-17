@@ -11,6 +11,7 @@
 
 #include "basefilesystem.h"
 #include "packfile.h"
+#include "foldercache.h"
 
 #ifdef _WIN32
 #include "tier0/tslist.h"
@@ -401,6 +402,13 @@ FILE *CFileSystem_Stdio::FS_fopen( const char *filenameT, const char *options, u
 
 	alignas(FILE *) CStdFilesystemFile *pFile = nullptr;
 
+	const bool bReadOnly = options[0] == 'r' && !strchr( options, '+' );
+	if ( bReadOnly && FolderCache::IsKnownMissing( filename ) )
+	{
+		errno = ENOENT;
+		return nullptr;
+	}
+
 #ifdef _WIN32
 	if ( CWin32ReadOnlyFile::CanOpen( filename, options ) )
 	{
@@ -409,10 +417,22 @@ FILE *CFileSystem_Stdio::FS_fopen( const char *filenameT, const char *options, u
 		{
 			return reinterpret_cast<FILE *>(pFile);
 		}
+
+		// Not there, opening it again through the CRT won't change that
+		const DWORD dwError = GetLastError();
+		if ( dwError == ERROR_FILE_NOT_FOUND || dwError == ERROR_PATH_NOT_FOUND )
+		{
+			errno = ENOENT;
+			return nullptr;
+		}
 	}
 #endif
 
 	pFile = CStdioFile::FS_fopen( filename, options, size );
+
+	if ( !bReadOnly )
+		FolderCache::OnPathChanged( filename );
+
 	return reinterpret_cast<FILE *>(pFile);
 }
 
@@ -574,6 +594,74 @@ int CFileSystem_Stdio::FS_chmod( const char *pathT, int pmode )
 	return rt;
 }
 
+#ifdef _WIN32
+static time_t FileTimeToTimeT( const FILETIME &ft )
+{
+	const uint64 ticks = ( (uint64)ft.dwHighDateTime << 32 ) | ft.dwLowDateTime;
+
+	// 100ns ticks since 1601 -> seconds since 1970
+	return (time_t)( ( ticks - 116444736000000000ull ) / 10000000ull );
+}
+
+static bool IsExecutableExtension( const char *path )
+{
+	const char *ext = V_GetFileExtension( path );
+	if ( !ext )
+		return false;
+
+	return !V_stricmp( ext, "exe" ) || !V_stricmp( ext, "cmd" ) || !V_stricmp( ext, "bat" ) || !V_stricmp( ext, "com" );
+}
+
+// _stat() opens a handle and reads the timezone from the registry every call.
+// This is one syscall and fills the same fields the CRT would
+static int Win32Stat( const char *path, struct _stat *buf )
+{
+	WIN32_FILE_ATTRIBUTE_DATA data;
+	if ( !GetFileAttributesExA( path, GetFileExInfoStandard, &data ) )
+	{
+		errno = ENOENT;
+		return -1;
+	}
+
+	const uint64 size = ( (uint64)data.nFileSizeHigh << 32 ) | data.nFileSizeLow;
+	if ( size > (uint64)std::numeric_limits<decltype( buf->st_size )>::max() )
+	{
+		errno = EOVERFLOW;
+		return -1;
+	}
+
+	unsigned short mode;
+	if ( data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY )
+		mode = _S_IFDIR | _S_IEXEC;
+	else
+		mode = _S_IFREG | ( IsExecutableExtension( path ) ? _S_IEXEC : 0 );
+
+	mode |= ( data.dwFileAttributes & FILE_ATTRIBUTE_READONLY ) ? _S_IREAD : ( _S_IREAD | _S_IWRITE );
+	mode |= ( mode & 0700 ) >> 3;
+	mode |= ( mode & 0700 ) >> 6;
+
+	memset( buf, 0, sizeof( *buf ) );
+	buf->st_mode = mode;
+	buf->st_nlink = 1;
+	buf->st_size = (decltype( buf->st_size ))size;
+	buf->st_mtime = FileTimeToTimeT( data.ftLastWriteTime );
+
+	// CRT falls back to the write time when these are 0 (FAT)
+	const bool hasAccess = data.ftLastAccessTime.dwLowDateTime || data.ftLastAccessTime.dwHighDateTime;
+	const bool hasCreate = data.ftCreationTime.dwLowDateTime || data.ftCreationTime.dwHighDateTime;
+	buf->st_atime = hasAccess ? FileTimeToTimeT( data.ftLastAccessTime ) : buf->st_mtime;
+	buf->st_ctime = hasCreate ? FileTimeToTimeT( data.ftCreationTime ) : buf->st_mtime;
+
+	if ( path[0] && path[1] == ':' )
+	{
+		const char drive = path[0] >= 'a' ? path[0] - 'a' : path[0] - 'A';
+		buf->st_dev = buf->st_rdev = drive;
+	}
+
+	return 0;
+}
+#endif
+
 //-----------------------------------------------------------------------------
 // Purpose: low-level filesystem wrapper
 //-----------------------------------------------------------------------------
@@ -591,6 +679,15 @@ int CFileSystem_Stdio::FS_stat( const char *pathT, struct _stat *buf, bool *pbLo
 
 	CBaseFileSystem::FixUpPath ( pathT, path );
 
+#ifdef _WIN32
+	if ( FolderCache::IsKnownMissing( path ) )
+	{
+		errno = ENOENT;
+		return -1;
+	}
+
+	return Win32Stat( path, buf );
+#else
 	int rt = _stat( path, buf );
 
 #if defined(LINUX)
@@ -601,19 +698,58 @@ int CFileSystem_Stdio::FS_stat( const char *pathT, struct _stat *buf, bool *pbLo
 		{
 			rt = _stat( caseFixedName, buf );
 		}
-	}	
+	}
 #endif
 	return rt;
+#endif
 }
 
 //-----------------------------------------------------------------------------
 // Purpose: low-level filesystem wrapper
 //-----------------------------------------------------------------------------
+// Finds answered from memory get a handle with the low bit set. Real find handles are heap pointers
+static HANDLE MemoryFindToHandle( FolderCache::FindState *pState )
+{
+	return (HANDLE)( (uintptr_t)pState | 1 );
+}
+
+static FolderCache::FindState *HandleToMemoryFind( HANDLE handle )
+{
+	if ( handle == INVALID_HANDLE_VALUE || !( (uintptr_t)handle & 1 ) )
+		return nullptr;
+	return (FolderCache::FindState *)( (uintptr_t)handle & ~(uintptr_t)1 );
+}
+
+// Only the name and the directory bit are read from it
+static void FillMemoryFindData( WIN32_FIND_DATA *dat, const char *pName, bool bDir )
+{
+	memset( dat, 0, sizeof( *dat ) );
+	dat->dwFileAttributes = bDir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+	V_strncpy( dat->cFileName, pName, sizeof( dat->cFileName ) );
+}
+
 HANDLE CFileSystem_Stdio::FS_FindFirstFile(const char *findnameT, WIN32_FIND_DATA *dat)
 {
 	char findname[ MAX_PATH ];
 
 	CBaseFileSystem::FixUpPath ( findnameT, findname );
+
+	FolderCache::FindState *pState = nullptr;
+	const char *pName = nullptr;
+	bool bDir = false;
+	switch ( FolderCache::FindFirst( findname, &pState, &pName, &bDir ) )
+	{
+	case FolderCache::FindResult::Found:
+		FillMemoryFindData( dat, pName, bDir );
+		return MemoryFindToHandle( pState );
+
+	case FolderCache::FindResult::NoMatch:
+		SetLastError( ERROR_FILE_NOT_FOUND );
+		return INVALID_HANDLE_VALUE;
+
+	case FolderCache::FindResult::NotHandled:
+		break;
+	}
 
 	return ::FindFirstFile(findname, dat);
 }
@@ -627,6 +763,20 @@ bool CFileSystem_Stdio::FS_FindNextFile(HANDLE handle, WIN32_FIND_DATA *dat)
 	if (INVALID_HANDLE_VALUE == handle)  // invalid handle should return false
 		return false;
 
+	if ( FolderCache::FindState *pState = HandleToMemoryFind( handle ) )
+	{
+		const char *pName = nullptr;
+		bool bDir = false;
+		if ( !FolderCache::FindNext( pState, &pName, &bDir ) )
+		{
+			SetLastError( ERROR_NO_MORE_FILES );
+			return false;
+		}
+
+		FillMemoryFindData( dat, pName, bDir );
+		return true;
+	}
+
 	return (::FindNextFile(handle, dat) != 0);
 }
 
@@ -635,6 +785,12 @@ bool CFileSystem_Stdio::FS_FindNextFile(HANDLE handle, WIN32_FIND_DATA *dat)
 //-----------------------------------------------------------------------------
 bool CFileSystem_Stdio::FS_FindClose(HANDLE handle)
 {
+	if ( FolderCache::FindState *pState = HandleToMemoryFind( handle ) )
+	{
+		FolderCache::FindClose( pState );
+		return true;
+	}
+
 	return (::FindClose(handle) != 0);
 }
 

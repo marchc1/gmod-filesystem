@@ -55,8 +55,33 @@ Addon::Folder* Addon::FileSystem::GetFolder( const std::string &strPath, bool bC
 	if ( !bCreate )
 		return nullptr;
 
-	it = m_Folders.emplace( strCleanPath, std::map<std::string, FileInfo>{} ).first;
+	it = m_Folders.emplace( strCleanPath, Folder{} ).first;
 	return &it->second;
+}
+
+// GMod gives every folder above a file an entry for the addon (empty names, keyed by the addon path).
+// Folders that only hold folders then show up in FindFirst and count as directories
+void Addon::FileSystem::AddParentFolders( std::string strFolder, const std::string &strKey, FileHandle_t hFileHandle, uint64_t wsid )
+{
+	while ( true )
+	{
+		Bootil::String::Util::TrimRight( strFolder, "\\/" );
+
+		size_t slash = strFolder.find_last_of( '/' );
+		if ( slash == std::string::npos )
+			slash = strFolder.find_last_of( '\\' );
+		if ( slash == std::string::npos )
+			return;
+
+		strFolder.resize( slash );
+		if ( strFolder.empty() )
+			return;
+
+		FileInfo &info = ( *GetFolder( strFolder, true ) )[strKey];
+		info = FileInfo{};
+		info.m_hFileHandle = hFileHandle;
+		info.m_nWsid = wsid;
+	}
 }
 
 // RaphaelIT7 (ToDo):
@@ -134,6 +159,8 @@ bool Addon::FileSystem::MountFile( const std::string& gmaPath, std::vector<std::
 
 	m_MountedAddons.push_back( std::move( addon ) );
 
+	std::string strLastFolder;
+	Folder* pFolder = nullptr;
 	for ( uint32_t i=0; i<reader.GetNumFiles(); ++i )
 	{
 		Addon::FileEntry& fileEntry = reader.GetFile( i );
@@ -142,7 +169,13 @@ bool Addon::FileSystem::MountFile( const std::string& gmaPath, std::vector<std::
 		Bootil::String::File::FixSlashes( strFixedFolder );
 		Bootil::String::File::StripFilename( strFixedFolder );
 
-		Folder* pFolder = GetFolder( strFixedFolder, true );
+		// Same entries every time for the same folder
+		if ( i == 0 || strFixedFolder != strLastFolder )
+		{
+			pFolder = GetFolder( strFixedFolder, true );
+			AddParentFolders( strFixedFolder, strAddonPath, hFileHandle, wsid );
+			strLastFolder = strFixedFolder;
+		}
 
 		std::string strFileName = fileEntry.strName;
 		Bootil::String::File::ExtractFilename( strFileName );
@@ -446,6 +479,8 @@ bool Addon::FileSystem::MountAddon( IAddonSystem::Information &info )
 
 	m_MountedAddons.push_back( std::move( addon ) );
 
+	std::string strLastFolder;
+	Folder* pFolder = nullptr;
 	for ( uint32_t i=0; i<reader.GetNumFiles(); ++i )
 	{
 		Addon::FileEntry& fileEntry = reader.GetFile( i );
@@ -454,7 +489,12 @@ bool Addon::FileSystem::MountAddon( IAddonSystem::Information &info )
 		Bootil::String::File::FixSlashes( strFixedFolder );
 		Bootil::String::File::StripFilename( strFixedFolder );
 
-		Folder* pFolder = GetFolder( strFixedFolder, true );
+		if ( i == 0 || strFixedFolder != strLastFolder )
+		{
+			pFolder = GetFolder( strFixedFolder, true );
+			AddParentFolders( strFixedFolder, info.file, hFileHandle, info.wsid );
+			strLastFolder = strFixedFolder;
+		}
 
 		std::string strFileName = fileEntry.strName;
 		Bootil::String::File::ExtractFilename( strFileName );
@@ -511,8 +551,76 @@ int64_t Addon::FileSystem::GetFileSize(std::string strRelativeFileName)
 	return pInfo->m_nSize;
 }
 
-Addon::FileInfo *Addon::FileSystem::GetFile( std::string strFileName )
+// Gives the same folder/file as NormalizePath + StripFilename + CleanPath + ExtractFilename.
+// false if the path has anything those would treat specially (whitespace at the ends, //, non-ASCII)
+static bool SplitAddonPath( std::string_view in, const std::string &strModPath, char (&buf)[MAX_PATH * 2], std::string_view &folder, std::string_view &file )
 {
+	if ( in.empty() || in.size() >= sizeof( buf ) )
+		return false;
+
+	auto isTrimmed = []( char c ) { return c == ' ' || c == '\n' || c == '\t' || c == '\r'; };
+	if ( isTrimmed( in.front() ) || isTrimmed( in.back() ) )
+		return false;
+
+	for ( size_t i = 0; i < in.size(); ++i )
+	{
+		unsigned char c = (unsigned char)in[i];
+		if ( c >= 0x80 )
+			return false;
+
+		if ( c == '\\' )
+			c = '/';
+		else if ( c >= 'A' && c <= 'Z' )
+			c += 'a' - 'A';
+
+		if ( c == '/' && i > 0 && buf[i - 1] == '/' )
+			return false;
+
+		buf[i] = (char)c;
+	}
+
+	std::string_view norm( buf, in.size() );
+	if ( norm.size() > strModPath.size() && norm.compare( 0, strModPath.size(), strModPath ) == 0 )
+		norm.remove_prefix( strModPath.size() );
+
+	size_t slash = norm.find_last_of( '/' );
+	if ( slash == std::string_view::npos )
+	{
+		folder = {};
+		file = norm;
+		return true;
+	}
+
+	folder = norm.substr( 0, slash );
+	file = norm.substr( slash + 1 );
+	while ( !folder.empty() && folder.front() == '/' )
+		folder.remove_prefix( 1 );
+	while ( !folder.empty() && folder.back() == '/' )
+		folder.remove_suffix( 1 );
+	return true;
+}
+
+Addon::FileInfo *Addon::FileSystem::GetFile( std::string_view strFileNameView )
+{
+	if ( !fs_tellmeyoursecrets.GetBool() )
+	{
+		if ( m_Folders.empty() )
+			return nullptr;
+
+		char buf[MAX_PATH * 2];
+		std::string_view folderName, fileName;
+		if ( SplitAddonPath( strFileNameView, m_strModPath, buf, folderName, fileName ) )
+		{
+			auto folder = m_Folders.find( folderName );
+			if ( folder == m_Folders.end() || folder->second.empty() )
+				return nullptr;
+
+			auto it = folder->second.find( fileName );
+			return it != folder->second.end() ? &it->second : nullptr;
+		}
+	}
+
+	std::string strFileName( strFileNameView );
 	if ( fs_tellmeyoursecrets.GetBool() )
 		Msg( "Addon[GetFile]: [%s]\n", strFileName.c_str() );
 
@@ -542,7 +650,7 @@ Addon::FileInfo *Addon::FileSystem::GetFile( std::string strFileName )
 	return &it->second;
 }
 
-Addon::FileHandle *Addon::FileSystem::GetFileEntry( std::string strFileName )
+Addon::FileHandle *Addon::FileSystem::GetFileEntry( std::string_view strFileName )
 {
 	FileInfo *pInfo = GetFile( strFileName );
 	if ( !pInfo )
@@ -941,8 +1049,110 @@ void Addon::FileSystem::FindInAddon( const std::string &pPath, const std::string
 	}
 }
 
+// Bootil's Wildcard without the two string copies
+bool globber( const char *wild, const char *string );
+
+static ConVar filesystem_gmafind( "filesystem_gmafind", "1", 0, "Only look at the GMA folders a FindFirst can match" );
+
+static bool FolderHasHandle( const Addon::Folder &folder, FileHandle_t hFileHandle )
+{
+	for ( const auto &[fileName, info] : folder )
+	{
+		if ( info.m_hFileHandle == hFileHandle )
+			return true;
+	}
+	return false;
+}
+
+// Same results in the same order as the walk over every folder in FindFirst
+void Addon::FileSystem::FindFirstLiteral( const std::string &path, const std::string &strDir, std::list<Addon::SearchFile> &results, FileHandle_t hFileHandle )
+{
+	std::string skip;
+	auto it = m_Folders.lower_bound( strDir );
+	while ( it != m_Folders.end() )
+	{
+		const std::string &folderName = it->first;
+		if ( folderName.compare( 0, strDir.length(), strDir ) != 0 )
+			break;
+
+		// Folder keys never end in '/', anything under a child has a '/' left after trimming.
+		// Jump to the next key that doesn't start with "<child>/"
+		const size_t slash = folderName.find( '/', strDir.length() );
+		if ( slash != std::string::npos && slash > strDir.length() )
+		{
+			skip.assign( folderName, 0, slash );
+			skip += (char)( '/' + 1 );
+			it = m_Folders.lower_bound( skip );
+			continue;
+		}
+
+		const Folder &folder = it->second;
+		++it;
+
+		if ( hFileHandle && !FolderHasHandle( folder, hFileHandle ) )
+			continue;
+
+		if ( !globber( path.c_str(), folderName.c_str() ) )
+			continue;
+
+		std::string relative = folderName.substr( strDir.length() );
+		Bootil::String::Util::Trim( relative, "/" );
+		if ( relative.empty() )
+			continue;
+
+		if ( Bootil::String::Util::Count( relative, '/' ) > 0 )
+			continue;
+
+		if ( fs_tellmeyoursecrets.GetBool() )
+			Msg( "Addon[FindFirst]: Folder Match [%s]\n", relative.c_str() );
+
+		SearchFile sf;
+		sf.m_strFileName = relative;
+		sf.m_bFolder = true;
+		results.push_back( std::move( sf ) );
+	}
+
+	Folder* folder = GetFolder( strDir, false );
+	if ( !folder || folder->empty() )
+	{
+		if ( fs_tellmeyoursecrets.GetBool() )
+			Msg( "Addon[FindFirst]: No matching folders or folder contains no files\n" );
+
+		return;
+	}
+
+	// strDir has no wildcards, when the file's folder is strDir only the rest has to match its name
+	const char *pNameWildcard = path.c_str() + strDir.length();
+	for ( auto& [name, info] : *folder )
+	{
+		if ( hFileHandle && info.m_hFileHandle != hFileHandle )
+			continue;
+
+		if ( info.m_strFolderName == strDir )
+		{
+			if ( !globber( pNameWildcard, info.m_strFileName.c_str() ) )
+				continue;
+		}
+		else if ( !globber( path.c_str(), ( info.m_strFolderName + info.m_strFileName ).c_str() ) )
+		{
+			continue;
+		}
+
+		if ( fs_tellmeyoursecrets.GetBool() )
+			Msg( "Addon[FindFirst]: Adding File [%s]\n", ( info.m_strFolderName + info.m_strFileName ).c_str() );
+
+		SearchFile sf;
+		sf.m_strFileName = info.m_strFileName;
+		sf.m_bFolder = false;
+		results.push_back( std::move( sf ) );
+	}
+}
+
 void Addon::FileSystem::FindFirst( const std::string &pPath, std::list<Addon::SearchFile> &results, FileHandle_t hFileHandle )
 {
+	if ( m_Folders.empty() && !fs_tellmeyoursecrets.GetBool() )
+		return;
+
 	std::string path = pPath;
 	NormalizePath( path );
 	if ( fs_tellmeyoursecrets.GetBool()  )
@@ -952,6 +1162,14 @@ void Addon::FileSystem::FindFirst( const std::string &pPath, std::list<Addon::Se
 	Bootil::String::File::StripFilename( strDir );
 	if ( fs_tellmeyoursecrets.GetBool() )
 		Msg( "Addon[FindFirst]: strDir [%s]\n", strDir.c_str() );
+
+	// Wildcard matches the folder part literally, only names starting with it can match
+	const bool bLiteralDir = strDir.find_first_of( "*?" ) == std::string::npos;
+	if ( bLiteralDir && filesystem_gmafind.GetBool() )
+	{
+		FindFirstLiteral( path, strDir, results, hFileHandle );
+		return;
+	}
 
 	for ( auto &[folderName, folder] : m_Folders )
 	{
@@ -1009,7 +1227,7 @@ void Addon::FileSystem::FindFirst( const std::string &pPath, std::list<Addon::Se
 		if ( hFileHandle && info.m_hFileHandle != hFileHandle )
 			continue;
 
-		std::string full = strDir + name;
+		std::string full = info.m_strFolderName + info.m_strFileName;
 		if ( !Bootil::String::Test::Wildcard( path, full ) )
 			continue;
 
@@ -1017,7 +1235,7 @@ void Addon::FileSystem::FindFirst( const std::string &pPath, std::list<Addon::Se
 			Msg( "Addon[FindFirst]: Adding File [%s]\n", full.c_str() );
 
 		SearchFile sf;
-		sf.m_strFileName = name;
+		sf.m_strFileName = info.m_strFileName;
 		sf.m_bFolder = false;
 		results.push_back( std::move( sf ) );
 	}

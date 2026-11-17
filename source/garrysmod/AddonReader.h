@@ -19,6 +19,8 @@ public:
 	Reader( uint64_t wsid );
 	bool ShouldBeExtracted( const std::string &strFileName );
 	bool OpenFile( const std::string &strFileName );
+	bool ParseHeader( FileHandle_t hFileHandle, Bootil::Buffer &buffer );
+	void ResetParse();
 	bool ReadAddonFile( FileHandle_t hFileHandle, Bootil::Buffer &buffer );
 	// RaphaelIT7: GMod also seems to pass the hFileHandle yet it's completely unused
 	bool ReadRequiredContent( Bootil::Buffer &buffer );
@@ -46,8 +48,10 @@ private:
 	// RaphaelIT7: Should always be 1 as GMad never writes anything else
 	// (also GMad uses a int32_t not uint32_t)
 	int32_t m_nAddonVersion = 0;
-	// RaphaelIT7: GMod loves to use std::list, wouldn't a std::vector be better here?
-	std::list<Addon::FileEntry> m_Files;
+	// GetFile is by index
+	std::vector<Addon::FileEntry> m_Files;
+	// No warnings while parsing a first chunk of the file, a failed parse gets redone on the full read
+	bool m_bQuiet = false;
 #if 0
 	// RaphaelIT7: unused in GMod
 	std::list<std::string> m_RequiredContent;
