@@ -30,6 +30,7 @@ private:
 
 	bool ChangeGamemode( const std::string& strGamemode, bool bRestore );
 	void AddGamemode( std::string strGamemode );
+	void MountContent( const std::string &strGamemode );
 
 	// RaphaelIT7:
 	// GMod just leaks the memory and ConVars.

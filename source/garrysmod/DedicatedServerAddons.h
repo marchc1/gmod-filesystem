@@ -1,32 +1,14 @@
 #pragma once
 
-#include "garrysmod/public/IAddonSystem.h"
+#include <cstdint>
 
+// The +host_workshop_collection downloader. Stock has this in dedicated.dll / dedicated_srv.so
 namespace GarrysMod
 {
-
-// RaphaelIT7:
-// This actually isn't a class
 namespace DedicatedServer
 {
-	// Called from DownloadAddon
-	void MountAddon(SteamUGCDetails_t unknown1, std::string unknown2, bool unknown3);
-
-	// Called from DownloadAddon
-	void MountSteamUGCAddon(SteamUGCDetails_t unknown1, char* unknown2);
-
-	// Called from RunAddonProcess
-	void DownloadCollection();
-
-	// Called from inside RunAddonProcess
-	void LoadCachedAddonList();
-
-	void RunChecks(const char* pszUnknown);
-
-	void DownloadAddon();
-
+	// Fetches the collection, downloads what's missing and hands every addon to Addons()->AddAddon
 	// Called from Addon::FileSystem::ScanForSubscriptions
-	void RunAddonProcess(const char* pszUnknown);
-};
-
+	void RunAddonProcess( const char *pszCollection, bool bAutoUpdate );
+}
 }

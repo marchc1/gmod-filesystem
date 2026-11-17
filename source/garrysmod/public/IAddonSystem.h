@@ -48,6 +48,9 @@ public:
 		uint32_t timeadded;
 		bool canUpdate;
 		bool downloaded;
+		bool unknown_b6; // there in GMod's struct, not seen read
+		bool legacy; // file is cache/workshop/<wsid>.gma, Steam's copy is a _legacy.bin
+		bool unknown_b8; // GMod's struct is 0xc0. When set, AddAddonFromSteamDetails replaces the entry
 	};
 
 	struct UGCInfo

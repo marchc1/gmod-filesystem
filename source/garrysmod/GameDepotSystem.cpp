@@ -9,6 +9,7 @@
 #include <Bootil/Bootil.h>
 #include <Bootil/Types/String.h>
 #include "steam/isteamapps.h"
+#include "basefilesystem.h"
 
 static const std::vector<IGameDepotSystem::Information>& MountableGames()
 {
@@ -51,23 +52,31 @@ static const std::vector<IGameDepotSystem::Information>& MountableGames()
 
 void GameDepot::System::Refresh()
 {
-	Msg( "GameDepot::System::Refresh()\n" );
+	FS_TRACE( "GameDepot::System::Refresh()\n" );
 	m_RefreshCount++;
 	Clear();
 	Load();
 
 	for ( auto &game : m_MountedGames )
 	{
+#ifdef DEDICATED
+		// Dedicated only has the sourceengine/content_*.vpk copies, retail games always use those
+		if ( game.owned && game.installed && game.mounted && !game.retail )
+			Mount( game, false );
+		else if ( game.retail )
+			MountAsFallback( game );
+#else
 		if ( game.owned && game.installed && game.mounted )
 			Mount( game, false );
 		else if ( game.retail )
 			MountAsFallback( game );
+#endif
 	}
 }
 
 void GameDepot::System::Clear()
 {
-	Msg( "GameDepot::System::Clear()\n" );
+	FS_TRACE( "GameDepot::System::Clear()\n" );
 	Setup();
 
 	g_pFullFileSystem->RemoveSearchPathsByGroup( PRIORITY_GROUP_HEAD( GN_CURRENTGAME ) );
@@ -76,7 +85,7 @@ void GameDepot::System::Clear()
 
 void GameDepot::System::SetMount( uint32_t nAppID, bool bMounted )
 {
-	Msg( "GameDepot::System::SetMount()\n" );
+	FS_TRACE( "GameDepot::System::SetMount()\n" );
 	for ( auto &v : m_MountedGames )
 	{
 		if (v.appid != nAppID)
@@ -92,7 +101,7 @@ void GameDepot::System::SetMount( uint32_t nAppID, bool bMounted )
 
 void GameDepot::System::MarkGameAsMounted( const std::string strGameFolder )
 {
-	Msg( "GameDepot::System::MarkGameAsMounted()\n" );
+	FS_TRACE( "GameDepot::System::MarkGameAsMounted()\n" );
 	for ( auto& v : m_MountedGames )
 	{
 		if ( v.folder == strGameFolder )
@@ -105,7 +114,7 @@ void GameDepot::System::MarkGameAsMounted( const std::string strGameFolder )
 
 const std::list<IGameDepotSystem::Information> &GameDepot::System::GetList()
 {
-	Msg( "GameDepot::System::GetList()\n" );
+	FS_TRACE( "GameDepot::System::GetList()\n" );
 	return m_MountedGames;
 }
 
@@ -117,12 +126,12 @@ int GameDepot::System::GetRefreshCount()
 GameDepot::System::System()
 {
 	m_RefreshCount = 0;
-	Msg( "GameDepot::System::System()\n" );
+	FS_TRACE( "GameDepot::System::System()\n" );
 }
 
 void GameDepot::System::FindGame( std::string &strGameName )
 {
-	Msg( "GameDepot::System::FindGame()\n" );
+	FS_TRACE( "GameDepot::System::FindGame()\n" );
 }
 
 bool GameDepot::System::MountAsSteampipe( Information &info, bool bHead )
@@ -174,7 +183,8 @@ void GameDepot::System::MountAsFallback( Information &info )
 {
 	DevMsg( "Mounting game '%s' as fallback (%s, %i)...\n", info.title.c_str(), info.folder.c_str(), info.appid );
 
-	std::string path = get->GameDir();
+	// Stock uses the root, sourceengine/ isn't under garrysmod/
+	std::string path = BaseFileSystem()->GMOD_GamePath();
 	path += "\\sourceengine\\";
 	path += "content_";
 	path += info.folder.c_str();
@@ -217,7 +227,7 @@ void GameDepot::System::Load()
 
 void GameDepot::System::Save()
 {
-	Msg( "GameDepot::System::Save()\n" );
+	FS_TRACE( "GameDepot::System::Save()\n" );
 	KeyValues* kv = new KeyValues( GAMEDEPOTSYSTEM );
 	RunCodeAtScopeExit( kv->deleteThis(); );
 

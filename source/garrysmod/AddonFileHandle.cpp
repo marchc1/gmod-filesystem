@@ -44,7 +44,7 @@ int Addon::FileHandle::Read( void *pBuffer, int nSize, int nLength )
 	return iRemaining;
 }
 
-unsigned int Addon::FileHandle::Seek( int64_t iOffset, int iSeekOrigin )
+unsigned int Addon::FileHandle::Seek( int64 iOffset, int iSeekOrigin )
 {
 	int64_t nNewPosition;
 	switch ( iSeekOrigin )

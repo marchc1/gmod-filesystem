@@ -101,7 +101,7 @@ void Addon::Task::DownloadFile::Cycle()
 	if ( !m_pAddonSystem->Notify() )
 		return;
 
-	uint64_t nDownloadedBytes, nTotalBytes = 0;
+	uint64 nDownloadedBytes = 0, nTotalBytes = 0;
 	if ( SteamUGC()->GetItemDownloadInfo( m_Info.wsid, &nDownloadedBytes, &nTotalBytes ) )
 	{
 		m_pAddonSystem->Notify()->DownloadProgress( m_Info.wsid, m_Info.hcontent_preview, m_Info.title.c_str(), nDownloadedBytes, nTotalBytes );

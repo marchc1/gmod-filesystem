@@ -2,7 +2,7 @@
 #include <time.h>
 #include "platform_extra.h"
 
-uint64_t Plat_USTime()
+uint64 Plat_USTime()
 {
 	static timespec start{};
 	static bool initialized = false;

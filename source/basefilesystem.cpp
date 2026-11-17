@@ -3436,16 +3436,8 @@ EFileCRCStatus CBaseFileSystem::CheckCachedFileHash( const char *pPathID, const 
 
 void CBaseFileSystem::EnableWhitelistFileTracking( bool bEnable, bool bCacheAllVPKHashes, bool bRecalculateAndCheckHashes )
 {
-	if ( m_WhitelistFileTrackingEnabled != -1 )
-	{
-		Error( "CBaseFileSystem::EnableWhitelistFileTracking called more than once." );
-	}
-	
-	m_WhitelistFileTrackingEnabled = bEnable;
-	if ( m_WhitelistFileTrackingEnabled && bCacheAllVPKHashes )
-	{
-		CacheAllVPKFileHashes( bCacheAllVPKHashes, bRecalculateAndCheckHashes );
-	}
+	// GMod's turns tracking off and ignores the args, so VPKs never get hashed
+	m_WhitelistFileTrackingEnabled = 0;
 }
 
 
@@ -3515,7 +3507,7 @@ void CBaseFileSystem::CacheAllVPKFileHashes( bool bCacheAllVPKHashes, bool bReca
 		}
 		if ( bCacheAllVPKHashes )
 		{
-			Msg( "Loaded %zd VPK file hashes from %s for pure server operation.\n", vecChunkHash.Count(), pVPK->FullPathName() );
+			FS_TRACE( "Loaded %zd VPK file hashes from %s for pure server operation.\n", vecChunkHash.Count(), pVPK->FullPathName() );
 			for ( auto &f : vecChunkHash )
 			{
 				m_FileTracker2.AddFileHashForVPKFile( f.m_nPackFileNumber, f.m_nFileFraction, f.m_cbChunkLen, f.m_md5contents, fhandle );
@@ -4704,16 +4696,9 @@ void CBaseFileSystem::RemoveFile( char const* pRelativePath, const char *pathID 
 		ComputeFullWritePath( szScratchFileName, sizeof( szScratchFileName ), pRelativePath, pathID );
 	}
 
-	const int nUnlinkResult = unlink( szScratchFileName );
-	const int nUnlinkErrno = errno;
+	// Stock doesn't warn when this fails
+	unlink( szScratchFileName );
 	FolderCache::OnPathChanged( szScratchFileName );
-
-	if ( nUnlinkResult )
-	{
-		Warning( FILESYSTEM_WARNING, "Unable to remove file '%s': %s.\n",
-			szScratchFileName,
-			std::generic_category().message(nUnlinkErrno).c_str() );
-	}
 }
 
 
@@ -5954,7 +5939,7 @@ void CBaseFileSystem::RemoveSearchPathsByGroup( int iPriorityGroup )
 	AsyncFinishAll();
 
 	iPriorityGroup >>= 1; // RaphaelIT7: IDA shows if (iPriorityGroup >> 1 == pSearchPath->m_PriorityGroupID)
-	Msg( "CBaseFileSystem::RemoveSearchPathsByGroup - %s\n", GMOD_GetSearchPathGroupName( iPriorityGroup ) );
+	FS_TRACE( "CBaseFileSystem::RemoveSearchPathsByGroup - %s\n", GMOD_GetSearchPathGroupName( iPriorityGroup ) );
 	for( int i=m_SearchPaths.Head(); i != m_SearchPaths.InvalidIndex(); )
 	{
 		int next = m_SearchPaths.Next( i );
@@ -5987,7 +5972,7 @@ IGameDepotSystem *CBaseFileSystem::Games()
 
 ILegacyAddons *CBaseFileSystem::LegacyAddons()
 {
-	Msg( "CBaseFileSystem::LegacyAddons\n" );
+	FS_TRACE( "CBaseFileSystem::LegacyAddons\n" );
 	return &m_LegacyAddonSystem;
 }
 
@@ -5998,7 +5983,7 @@ IGModLanguage *CBaseFileSystem::Language()
 
 void CBaseFileSystem::DoFilesystemRefresh()
 {
-	Msg( "CBaseFileSystem::DoFilesystemRefresh\n" );
+	FS_TRACE( "CBaseFileSystem::DoFilesystemRefresh\n" );
 	++m_iRefreshCounter;
 }
 
@@ -6064,10 +6049,8 @@ void CBaseFileSystem::MountDirectoryAndVPKs( const char* pszPath )
 			std::string strFilename = pszFile;
 			if ( Bootil::String::Test::EndsWith( strFilename, "_000.vpk" ) )
 			{
-				std::string strFullPath = pszFile;
-				if ( !strFullPath.empty() && strFullPath.back() != '/' )
-					strFullPath += '/';
-
+				std::string strFullPath = pszPath;
+				strFullPath += '\\';
 				strFullPath += pszFile;
 				if ( fs_tellmeyoursecrets.GetInt() )
 					Msg( "mount.cfg adding '%s'\n", strFullPath.c_str() );
@@ -6141,7 +6124,7 @@ bool GMOD_IsValidPath( const char* s )
 // pszModPath is the relative path to the mod dir -> garrysmod/
 void CBaseFileSystem::GMOD_SetupDefaultPaths( const char *pszGamePath, const char *pszModPath )
 {
-	Msg( "CFileSystem_Stdio::GMOD_SetupDefaultPaths called with %s %s\n", pszGamePath, pszModPath );
+	FS_TRACE( "CFileSystem_Stdio::GMOD_SetupDefaultPaths called with %s %s\n", pszGamePath, pszModPath );
 
 	m_strGamePath = pszGamePath;
 	m_strModPath = pszModPath;
@@ -6244,7 +6227,8 @@ void CBaseFileSystem::GMOD_SetupDefaultPaths( const char *pszGamePath, const cha
 		AddSearchPath( ( downloads + "/fallbacks" ).c_str(), "MOD", PRIORITY_GROUP_TAIL( GN_FALLBACKS ) );
 	}
 
-	PrintSearchPaths();
+	if ( fs_tellmeyoursecrets.GetInt() > 1 )
+		PrintSearchPaths();
 }
 
 // RaphaelIT7:
@@ -6253,7 +6237,7 @@ void CBaseFileSystem::GMOD_SetupDefaultPaths( const char *pszGamePath, const cha
 // Update: It does exist in newer build and in fact is called
 void CBaseFileSystem::GMOD_FixPathCase( char *pszPath, size_t nPathLength )
 {
-	Msg( "CBaseFileSystem::GMOD_FixPathCase (%s)\n", pszPath );
+	FS_TRACE( "CBaseFileSystem::GMOD_FixPathCase (%s)\n", pszPath );
 
 	char szFixedPath[260];
 #ifdef POSIX

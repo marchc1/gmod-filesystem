@@ -234,6 +234,9 @@ public:
 	void NoteFileUnloaded( const char *pFilename, const char *pPathID ) {}
 
 	IFileList *GetFilesToUnloadForWhitelistChange( IPureServerWhitelist *pNewWhiteList ) { return NULL; }
+
+	// Nothing is tracked here
+	const size_t *TrackedVPKFileCountPtr() const { static const size_t s_nNone = 0; return &s_nNone; }
 };
 
 #endif // DEDICATED

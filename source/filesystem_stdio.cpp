@@ -720,11 +720,22 @@ static FolderCache::FindState *HandleToMemoryFind( HANDLE handle )
 	return (FolderCache::FindState *)( (uintptr_t)handle & ~(uintptr_t)1 );
 }
 
+#ifndef _WIN32
+// linux_support's find has no last error, the folder cache never answers finds there anyway
+static void SetLastError( int ) {}
+#define ERROR_FILE_NOT_FOUND 2
+#define ERROR_NO_MORE_FILES 18
+#endif
+
 // Only the name and the directory bit are read from it
 static void FillMemoryFindData( WIN32_FIND_DATA *dat, const char *pName, bool bDir )
 {
 	memset( dat, 0, sizeof( *dat ) );
+#ifdef _WIN32
 	dat->dwFileAttributes = bDir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+#else
+	dat->dwFileAttributes = bDir ? FILE_ATTRIBUTE_DIRECTORY : 0;
+#endif
 	V_strncpy( dat->cFileName, pName, sizeof( dat->cFileName ) );
 }
 

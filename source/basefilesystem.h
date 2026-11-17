@@ -931,6 +931,9 @@ public: // GMOD
 	virtual void GMOD_SetupDefaultPaths( const char *pszGamePath, const char *pszModPath );
 	virtual void GMOD_FixPathCase( char *, size_t = 0);
 
+	// GarrysMod/ (or the srcds root), as given to GMOD_SetupDefaultPaths
+	const std::string &GMOD_GamePath() const { return m_strGamePath; }
+
 private: // GMOD
 	CLanguage m_Language;
 	GameDepot::System m_GameDepotSystem;

@@ -2,6 +2,7 @@
 #include "filesystem.h"
 #include "public/IGet.h"
 #include "garrysmod/public/IMenuSystem.h"
+#include "garrysmod/public/ILegacyAddons.h"
 #include "keyvalues.h"
 #include <sdk_backports.h>
 
@@ -51,6 +52,48 @@ void Gamemode::System::Refresh()
 	g_pFullFileSystem->FindClose( hFindHandle );
 
 	SetActive( (std::string)gamemode.GetString() );
+
+	const IGamemodeSystem::Information &active = Active();
+	if ( active.exists )
+		MountContent( active.name );
+}
+
+// Every gamemode/content folder of the gamemode and the ones it derives from
+void Gamemode::System::MountContent( const std::string &strGamemode )
+{
+	const IGamemodeSystem::Information info = FindByName( strGamemode );
+	if ( !info.exists )
+		return;
+
+	const SearchPathAdd_t addType = (SearchPathAdd_t)PRIORITY_GROUP_TAIL( GN_GMCONTENT );
+	auto mountIfFolder = [&]( const std::string &strPath )
+	{
+		if ( !g_pFullFileSystem->IsDirectory( strPath.c_str(), "MOD" ) )
+			return;
+
+		char szFullPath[MAX_PATH];
+		if ( !g_pFullFileSystem->RelativePathToFullPath( strPath.c_str(), "MOD", szFullPath, sizeof( szFullPath ) ) )
+			return;
+
+		g_pFullFileSystem->AddSearchPath( szFullPath, "GAME", addType );
+		g_pFullFileSystem->AddSearchPath( szFullPath, "thirdparty", addType );
+	};
+
+	// Legacy addons that carry gamemodes
+	for ( const ILegacyAddons::Information &addon : g_pFullFileSystem->LegacyAddons()->GetList() )
+	{
+		if ( !addon.gamemodepath.empty() )
+			mountIfFolder( addon.gamemodepath + "/" + info.name + "/content" );
+	}
+
+	// The workshop one gets added even when it doesn't exist
+	const std::string strWorkshop = std::string( get->GameDir() ) + "/workshop/gamemodes/" + info.name + "/content";
+	g_pFullFileSystem->AddSearchPath( strWorkshop.c_str(), "GAME", addType );
+	g_pFullFileSystem->AddSearchPath( strWorkshop.c_str(), "thirdparty", addType );
+
+	mountIfFolder( "gamemodes/" + info.name + "/content" );
+
+	MountContent( info.basename );
 }
 
 void Gamemode::System::Clear()

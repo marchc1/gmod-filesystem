@@ -12,7 +12,7 @@
 
 void Addon::FileSystem::Clear()
 {
-	Msg( "Addon::FileSystem::Clear\n" );
+	FS_TRACE( "Addon::FileSystem::Clear\n" );
 	for ( auto &pAddon : m_MountedAddons )
 	{
 		if ( pAddon.m_hFileHandle != FILESYSTEM_INVALID_HANDLE )
@@ -25,22 +25,30 @@ void Addon::FileSystem::Clear()
 
 void Addon::FileSystem::Refresh()
 {
-	Msg( "Addon::FileSystem::Refresh\n" );
-
 	UpdateModPath();
+
+	int nMounted = 0;
 	for ( IAddonSystem::Information &info : m_Addons )
 	{
-		if ( MountAddon( info ) )
+		if ( !info.failure.empty() )
 			continue;
 
-		if ( !info.downloaded || info.file.find( "cache/" ) == std::string::npos )
+		if ( MountAddon( info ) )
+		{
+			if ( ShouldMount( info.wsid ) )
+				++nMounted;
+			continue;
+		}
+
+		// Only our own extracted copies
+		if ( !info.legacy || info.file.compare( 0, 6, "cache/" ) != 0 )
 			continue;
 
 		Warning( "Removing bad addon %s\n\n", info.file.c_str() );
 		g_pFullFileSystem->RemoveFile( info.file.c_str(), "MOD" );
 	}
 
-	Load();
+	Msg( "Mounted %i of %i workshop addons!\n", nMounted, (int)m_Addons.size() );
 }
 
 Addon::Folder* Addon::FileSystem::GetFolder( const std::string &strPath, bool bCreate )
@@ -88,7 +96,7 @@ void Addon::FileSystem::AddParentFolders( std::string strFolder, const std::stri
 // It currently crashes after the last call made here, idk why.
 bool Addon::FileSystem::MountFile( const std::string& gmaPath, std::vector<std::string>* files, uint64_t wsid, uint64_t wsid2, IAddonSystem::AddonSource source )
 {
-	Msg( "Addon::FileSystem::MountFile (%s - %llu - %llu - %i)\n", gmaPath.c_str(), wsid, wsid2, source.m_UnknownValue );
+	FS_TRACE( "Addon::FileSystem::MountFile (%s - %llu - %llu - %i)\n", gmaPath.c_str(), wsid, wsid2, source.m_UnknownValue );
 
 	std::string strAddonPath = gmaPath;
 	Bootil::String::Lower( strAddonPath );
@@ -195,8 +203,8 @@ bool Addon::FileSystem::MountFile( const std::string& gmaPath, std::vector<std::
 		if ( existing != pFolder->end() )
 		{
 			FileInfo& oldInfo = existing->second;
-			if ( oldInfo.m_nWsid != wsid && Bootil::String::Test::EndsWith( strFileName, ".lua" ) )
-				Warning( "Addon '%s' (%llu) contains file from %llu: '%s'\n", strAddonPath.c_str(), wsid , oldInfo.m_nWsid , oldInfo.m_strFileName.c_str() );
+			if ( oldInfo.m_nWsid != wsid && Bootil::String::Test::EndsWith( fileEntry.strName, ".lua" ) )
+				Warning( "Addon '%s' (%llu) contains file from %llu: '%s'\n", strAddonPath.c_str(), wsid , oldInfo.m_nWsid , fileEntry.strName.c_str() );
 
 			existing->second = std::move( info );
 		}
@@ -210,7 +218,7 @@ bool Addon::FileSystem::MountFile( const std::string& gmaPath, std::vector<std::
 
 bool Addon::FileSystem::ShouldMount( uint64_t wsid )
 {
-	Msg( "Addon::FileSystem::ShouldMount (%llu)\n", wsid );
+	FS_TRACE( "Addon::FileSystem::ShouldMount (%llu)\n", wsid );
 	auto it = m_AddonNoMount.find( wsid );
 	if ( it != m_AddonNoMount.end() )
 		return false;
@@ -221,7 +229,7 @@ bool Addon::FileSystem::ShouldMount( uint64_t wsid )
 			return true;
 	}
 
-	Msg( "CAddonFileSystem::ShouldMount Nope? (%llu)\n", wsid );
+	FS_TRACE( "CAddonFileSystem::ShouldMount Nope? (%llu)\n", wsid );
 
 	return false;
 }
@@ -229,7 +237,7 @@ bool Addon::FileSystem::ShouldMount( uint64_t wsid )
 // RaphaelIT7 (Verify): Does it truly return bShouldMount? Seems like that in IDA for both linux & macos
 bool Addon::FileSystem::SetShouldMount( uint64_t wsid, bool bShouldMount )
 {
-	Msg( "Addon::FileSystem::SetShouldMount (%llu - %s)\n", wsid, bShouldMount ? "true" : "false" );
+	FS_TRACE( "Addon::FileSystem::SetShouldMount (%llu - %s)\n", wsid, bShouldMount ? "true" : "false" );
 
 	auto it = m_AddonNoMount.find( wsid );
 	if (it != m_AddonNoMount.end())
@@ -244,7 +252,7 @@ bool Addon::FileSystem::SetShouldMount( uint64_t wsid, bool bShouldMount )
 
 void Addon::FileSystem::Save()
 {
-	Msg( "CAddonFileSystem::Save\n" );
+	FS_TRACE( "CAddonFileSystem::Save\n" );
 	KeyValues* kv = new KeyValues( "addonnomount" );
 	RunCodeAtScopeExit( kv->deleteThis(); );
 
@@ -270,20 +278,20 @@ void Addon::FileSystem::Save()
 
 const std::list<IAddonSystem::Information>& Addon::FileSystem::GetList() const
 {
-	Msg( "CAddonFileSystem::GetList\n" );
+	FS_TRACE( "CAddonFileSystem::GetList\n" );
 
 	return m_Addons;
 }
 
 const std::list<IAddonSystem::UGCInfo>& Addon::FileSystem::GetUGCList() const
 {
-	Msg( "CAddonFileSystem::GetUGCList\n" );
+	FS_TRACE( "CAddonFileSystem::GetUGCList\n" );
 	return m_UgcAddons;
 }
 
 void Addon::FileSystem::ScanForSubscriptions( const char *unknown1, bool unknown2 ) // NOTE: Gmod uses the Steamworks 1.57. The sourcesdk-minimal was outdated.
 {
-	Msg( "CAddonFileSystem::ScanForSubscriptions (%s - %s)\n", unknown1, unknown2 ? "true" : "false" );
+	FS_TRACE( "CAddonFileSystem::ScanForSubscriptions (%s - %s)\n", unknown1, unknown2 ? "true" : "false" );
 	if (!get)
 	{
 		Error( "SFS: !get" );
@@ -292,8 +300,7 @@ void Addon::FileSystem::ScanForSubscriptions( const char *unknown1, bool unknown
 
 	if ( get->IsDedicatedServer() )
 	{
-		Warning( "   ^-- TODO: GarrysMod::DedicatedServer::RunAddonProcess!\n" );
-		GarrysMod::DedicatedServer::RunAddonProcess( unknown1 );
+		GarrysMod::DedicatedServer::RunAddonProcess( unknown1, unknown2 );
 		MountFloatingAddons();
 		return;
 	}
@@ -426,22 +433,24 @@ bool Addon::FileSystem::UnmountFile( std::string strFileName, const char *pszRea
 
 bool Addon::FileSystem::MountAddon( IAddonSystem::Information &info )
 {
-	Msg( "Addon::FileSystem::MountAddon (%llu)\n", info.wsid );
+	FS_TRACE( "Addon::FileSystem::MountAddon (%llu)\n", info.wsid );
 
-	if ( info.downloaded )
+	// Same order as GMod: not downloaded yet or turned off is nothing to mount, legacy ones keep cache/workshop/<wsid>.gma
+	if ( !info.downloaded )
+		return true;
+
+	if ( info.legacy )
 	{
-		if ( info.canUpdate )
-		{
-			std::string outdatedPath = info.file + ".outdated";
-			if ( g_pFullFileSystem->FileExists( outdatedPath.c_str(), "MOD" ) )
-				g_pFullFileSystem->RemoveFile( outdatedPath.c_str(), "MOD" );
-		}
-
-		if ( !SetShouldMount( info.wsid, info.downloaded ) )
-			return true;
-
-		info.file = GetAddonFilepath( info.wsid, false );
+		std::string outdatedPath = info.file + ".outdated";
+		if ( g_pFullFileSystem->FileExists( outdatedPath.c_str(), "MOD" ) )
+			g_pFullFileSystem->RemoveFile( outdatedPath.c_str(), "MOD" );
 	}
+
+	if ( !ShouldMount( info.wsid ) )
+		return true;
+
+	if ( !info.legacy )
+		info.file = GetAddonFilepath( info.wsid, true );
 
 	if ( info.file.empty() )
 	{
@@ -514,8 +523,14 @@ bool Addon::FileSystem::MountAddon( IAddonSystem::Information &info )
 		if ( existing != pFolder->end() )
 		{
 			FileInfo& oldInfo = existing->second;
-			if ( oldInfo.m_nWsid != info.wsid && Bootil::String::Test::EndsWith( strFileName, ".lua" ) )
-				Warning( "Addon '%s' (%llu) contains file from %llu: '%s'\n", info.title.c_str(), info.wsid, oldInfo.m_nWsid, oldInfo.m_strFileName.c_str() );
+			// Identical copies (same size) aren't reported
+			if ( oldInfo.m_nWsid != info.wsid && oldInfo.m_nSize != fileInfo.m_nSize && Bootil::String::Test::EndsWith( fileEntry.strName, ".lua" ) )
+			{
+				if ( Notify() )
+					Notify()->NotifyAddonConflict( info.wsid, oldInfo.m_nWsid, fileEntry.strName.c_str() );
+				else
+					Warning( "Addon '%s' (%llu) contains file from %llu: '%s'\n", info.title.c_str(), info.wsid, oldInfo.m_nWsid, fileEntry.strName.c_str() );
+			}
 
 			existing->second = std::move( fileInfo );
 		}
@@ -704,19 +719,19 @@ void Addon::FileSystem::Think()
 
 void Addon::FileSystem::SetDownloadNotify( IAddonDownloadNotification *pDownloadNotify )
 {
-	Msg( "CAddonFileSystem::SetDownloadNotify\n" );
+	FS_TRACE( "CAddonFileSystem::SetDownloadNotify\n" );
 	m_pDownloadNotify = pDownloadNotify;
 }
 
 IAddonDownloadNotification *Addon::FileSystem::Notify()
 {
-	Msg( "CAddonFileSystem::Notify\n" );
+	FS_TRACE( "CAddonFileSystem::Notify\n" );
 	return m_pDownloadNotify;
 }
 
 bool Addon::FileSystem::IsSubscribed( uint64_t wsid )
 {
-	Msg( "Addon::FileSystem::IsSubscribed (%llu)\n", wsid );
+	FS_TRACE( "Addon::FileSystem::IsSubscribed (%llu)\n", wsid );
 	for ( IAddonSystem::Information info : m_Addons )
 	{
 		if ( info.wsid == wsid )
@@ -728,7 +743,7 @@ bool Addon::FileSystem::IsSubscribed( uint64_t wsid )
 
 const IAddonSystem::Information* Addon::FileSystem::FindFileOwner( const std::string &strFileName )
 {
-	Msg( "Addon::FileSystem::FindFileOwner (%s)\n", strFileName.c_str() );
+	FS_TRACE( "Addon::FileSystem::FindFileOwner (%s)\n", strFileName.c_str() );
 	std::string strNormalizedFileName = strFileName;
 	NormalizePath( strNormalizedFileName );
 
@@ -756,13 +771,13 @@ const IAddonSystem::Information* Addon::FileSystem::FindFileOwner( const std::st
 // RaphaelIT7: Note for me dumb dumb. If we give it something, m_Addons makes a copy!
 void Addon::FileSystem::AddAddon( const IAddonSystem::Information &info )
 {
-	Msg( "Addon::FileSystem::AddAddon (%llu)\n", info.wsid );
+	FS_TRACE( "Addon::FileSystem::AddAddon (%llu)\n", info.wsid );
 	m_Addons.push_back( info );
 }
 
 void Addon::FileSystem::ClearUnusedGMAs()
 {
-	Msg( "Addon::FileSystem::ClearUnusedGMAs\n" );
+	FS_TRACE( "Addon::FileSystem::ClearUnusedGMAs\n" );
 	AddJob( new Addon::Task::ClearUnusedGMAs );
 }
 
@@ -777,9 +792,9 @@ Addon::AddonType Addon::FileSystem::GetAddonType(SteamUGCDetails_t details)
 	return Addon::AddonType::Unknown;
 }
 
-std::string Addon::FileSystem::GetAddonFilepath( uint64 wsid, bool bGMAOnly )
+std::string Addon::FileSystem::GetAddonFilepath( uint64_t wsid, bool bGMAOnly )
 {
-	Msg( "Addon::FileSystem::GetAddonFilepath (%llu - %s)\n", wsid, bGMAOnly ? "true" : "false" );
+	FS_TRACE( "Addon::FileSystem::GetAddonFilepath (%llu - %s)\n", wsid, bGMAOnly ? "true" : "false" );
 	char szFolder[260];
 	uint64 size;
 	uint32 timestamp;
@@ -819,17 +834,17 @@ std::string Addon::FileSystem::GetAddonFilepath( uint64 wsid, bool bGMAOnly )
 
 void Addon::FileSystem::UnmountAddon( uint64_t wsid, const char *pszReason )
 {
-	Msg( "Addon::FileSystem::UnmountAddon (%llu - %s)\n", wsid, pszReason );
+	FS_TRACE( "Addon::FileSystem::UnmountAddon (%llu - %s)\n", wsid, pszReason );
 }
 
 void Addon::FileSystem::UnmountServerAddons()
 {
-	Msg( "Addon::FileSystem::UnmountServerAddons\n" );
+	FS_TRACE( "Addon::FileSystem::UnmountServerAddons\n" );
 }
 
 std::string Addon::FileSystem::IsAddonValidPreInstall( SteamUGCDetails_t details )
 {
-	Msg( "Addon::FileSystem::IsAddonValidPreInstall (%llu)\n", details.m_nPublishedFileId );
+	FS_TRACE( "Addon::FileSystem::IsAddonValidPreInstall (%llu)\n", details.m_nPublishedFileId );
 	if ( details.m_bBanned )
 		return "Addon is banned";
 
@@ -857,31 +872,31 @@ std::string Addon::FileSystem::IsAddonValidPreInstall( SteamUGCDetails_t details
 // Else you will wait forever.
 bool Addon::FileSystem::AllJobsFinished()
 {
-	Msg( "Addon::FileSystem::AllJobsFinished\n" );
+	FS_TRACE( "Addon::FileSystem::AllJobsFinished\n" );
 	return m_pCurrentJob == nullptr && m_Jobs.empty();
 }
 
 void Addon::FileSystem::Shutdown()
 {
-	Msg( "Addon::FileSystem::Shutdown\n" );
+	FS_TRACE( "Addon::FileSystem::Shutdown\n" );
 }
 
 void Addon::FileSystem::AddJob( Addon::Job::Base* job )
 {
-	Msg( "Addon::FileSystem::AddJob\n" );
+	FS_TRACE( "Addon::FileSystem::AddJob\n" );
 	job->Init(this);
 	m_Jobs.push_back(job);
 }
 
 const std::list<SteamUGCDetails_t>& Addon::FileSystem::GetSubList() const
 {
-	Msg( "Addon::FileSystem::GetSubList\n" );
+	FS_TRACE( "Addon::FileSystem::GetSubList\n" );
 	return m_Subscriptions;
 }
 
 void Addon::FileSystem::MountFloatingAddons()
 {
-	Msg( "Addon::FileSystem::MountFloatingAddons\n" );
+	FS_TRACE( "Addon::FileSystem::MountFloatingAddons\n" );
 
 	FileFindHandle_t hFindHandle;
 	// RaphaelIT7:
@@ -897,89 +912,111 @@ void Addon::FileSystem::MountFloatingAddons()
 	g_pFullFileSystem->FindClose( hFindHandle );
 }
 
+#ifdef PLATFORM_64BITS
+static_assert( sizeof( IAddonSystem::Information ) == 0xc0, "GMod reads these out of GetList" );
+#endif
+
 void Addon::FileSystem::AddAddonFromSteamDetails( const SteamUGCDetails_t& details )
 {
-	for (const auto& info : m_Addons)
-		if (info.wsid == details.m_nPublishedFileId)
-			return;
+	const uint64 wsid = details.m_nPublishedFileId;
 
-	Addon::AddonType type = GetAddonType(details);
-	IAddonSystem::Information info = {};
-	switch (type)
+	// Entries marked with unknown_b8 get replaced, the rest stay
+	for ( auto it = m_Addons.begin(); it != m_Addons.end(); ++it )
 	{
-	case Addon::AddonType::Addon:
-	{
-		info.title = details.m_rgchTitle;
-		info.tags = details.m_rgchTags;
-		info.wsid = details.m_nPublishedFileId;
-		info.creator = details.m_ulSteamIDOwner;
-		info.time_updated = details.m_rtimeUpdated;
-		info.size = details.m_nFileSize;
-		info.hcontent_file = details.m_hFile;
-		info.hcontent_preview = details.m_hPreviewFile;
-		info.timeadded = details.m_rtimeAddedToUserList;
-		info.canUpdate = false;
-		info.downloaded = true;
-		break;
+		if ( it->wsid == wsid && it->unknown_b8 )
+		{
+			m_Addons.erase( it );
+			break;
+		}
 	}
 
-	case Addon::AddonType::Dupe:
-	case Addon::AddonType::Save:
-	case Addon::AddonType::Demo:
-	case Addon::AddonType::ServerContent:
+	const Addon::AddonType type = GetAddonType( details );
+	if ( type == Addon::AddonType::Dupe || type == Addon::AddonType::Save || type == Addon::AddonType::Demo )
+	{
 		AddUGCFile( details, type );
 		return;
-
-	default:
-		// Unknown tag: warn / ignore
-		Warning( "Addon has unknown type, ignoring (%llu)\n", details.m_nPublishedFileId );
-		break;
 	}
 
-	std::string strRefuse = IsAddonValidPreInstall( details );
+	// Still loaded as an addon
+	if ( type == Addon::AddonType::Unknown )
+		Warning( "'%s' is missing Addon, ServerContent, Dupe, Demo or Save tag!\n", details.m_rgchTitle );
+
+	const std::string strRefuse = IsAddonValidPreInstall( details );
 	if ( !strRefuse.empty() )
+		Warning( "Error! Refusing to load addon '%s' (%llu)! %s!\n", details.m_rgchTitle, wsid, strRefuse.c_str() );
+
+	uint32 nItemState = SteamUGC()->GetItemState( wsid );
+	if ( ( nItemState & ( k_EItemStateInstalled | k_EItemStateNeedsUpdate ) ) == k_EItemStateInstalled )
 	{
-		Warning( "Error! Refusing to load addon '%s' (%llu)! %s!\n", info.title.c_str(), info.wsid, strRefuse.c_str() );
-		AddAddon( info ); // We still wanna show them?
-		return;
+		char szFolder[260] = {};
+		uint64 size = 0;
+		uint32 timestamp = 0;
+		if ( SteamUGC()->GetItemInstallInfo( wsid, &size, szFolder, sizeof( szFolder ), &timestamp ) && timestamp != details.m_rtimeUpdated )
+			nItemState |= k_EItemStateNeedsUpdate;
 	}
 
-	if ( SteamUGC()->GetItemState( details.m_nPublishedFileId ) & k_EItemStateInstalled )
-	{
-		info.downloaded = true;
+	// Legacy items come as a _legacy.bin, GMod mounts the copy it keeps in cache/workshop
+	std::string strAddonPath = Bootil::String::Format::Print( "cache/workshop/%llu.gma", wsid );
+	if ( !( nItemState & k_EItemStateLegacyItem ) )
+		strAddonPath = "";
 
-		char szFolder[260];
-		uint64 size;
-		uint32 timestamp;
-		SteamUGC()->GetItemInstallInfo( details.m_nPublishedFileId, &size, szFolder, sizeof( szFolder ), &timestamp );
-		if ( details.m_rtimeUpdated != timestamp )
-			info.canUpdate = true;
+	for ( const IAddonSystem::Information &existing : m_Addons )
+	{
+		if ( existing.legacy && existing.file == strAddonPath && !existing.unknown_b8 )
+		{
+			Warning( "Tried to add duplicate file from %s (%llu) which is already mounted from %s (%llu)\n", details.m_rgchTitle, wsid, existing.title.c_str(), existing.wsid );
+			return;
+		}
 	}
 
-	std::string strAddonPath = Bootil::String::Format::Print( "cache/workshop/%llu.gma", info.wsid );
-	FileHandle_t hFileHandle = g_pFullFileSystem->Open( strAddonPath.c_str(), "rb", "MOD" );
+	IAddonSystem::Information info = {};
+	info.title = details.m_rgchTitle;
+	info.file = strAddonPath;
+	info.tags = details.m_rgchTags;
+	info.failure = strRefuse;
+	info.time_updated = details.m_rtimeUpdated;
+	info.model_count = 0;
+	info.wsid = wsid;
+	info.creator = details.m_ulSteamIDOwner;
+	info.hcontent_file = details.m_hFile;
+	info.size = (uint32)details.m_nFileSize;
+	info.hcontent_preview = details.m_hPreviewFile;
+	info.timeadded = details.m_rtimeAddedToUserList;
+	info.canUpdate = ( nItemState & k_EItemStateNeedsUpdate ) != 0;
+	info.downloaded = ( nItemState & ( k_EItemStateLegacyItem | k_EItemStateInstalled ) ) == k_EItemStateInstalled;
+	info.unknown_b6 = false;
+	info.legacy = ( nItemState & k_EItemStateLegacyItem ) != 0;
+	info.unknown_b8 = false;
 
-	if ( !hFileHandle )
-		hFileHandle = g_pFullFileSystem->Open( strAddonPath.c_str(), "rb", nullptr );
+	// No details from Steam (hidden, deleted)
+	if ( info.title.empty() )
+		info.title = "Hidden addon #" + std::to_string( wsid );
 
-	if ( !hFileHandle )
+	Bootil::String::Util::FindAndReplace( info.title, "\n", "" );
+	Bootil::String::Util::FindAndReplace( info.title, "\r", "" );
+
+	if ( info.legacy )
 	{
-		// We still add it as the menusystem can show failed to download
-		AddAddon(info);
-		return;
-	}
+		FileHandle_t hFileHandle = g_pFullFileSystem->Open( strAddonPath.c_str(), "rb", "MOD" );
+		if ( !hFileHandle )
+			hFileHandle = g_pFullFileSystem->Open( strAddonPath.c_str(), "rb", nullptr );
 
-	info.downloaded = true;
+		if ( hFileHandle )
+		{
+			info.downloaded = true;
 
-	uint32 nAddonTimestamp = 0;
-	g_pFullFileSystem->Seek( hFileHandle, Addon::TimestampOffset, FILESYSTEM_SEEK_HEAD );
-	g_pFullFileSystem->Read( &nAddonTimestamp, sizeof(nAddonTimestamp), hFileHandle );
-	g_pFullFileSystem->Close( hFileHandle );
+			uint32 nAddonTimestamp = 0;
+			g_pFullFileSystem->Seek( hFileHandle, Addon::TimestampOffset, FILESYSTEM_SEEK_HEAD );
+			g_pFullFileSystem->Read( &nAddonTimestamp, sizeof( nAddonTimestamp ), hFileHandle );
+			g_pFullFileSystem->Close( hFileHandle );
 
-	if ( details.m_rtimeUpdated != nAddonTimestamp )
-	{
-		info.canUpdate = true;
-		Msg( "Legacy addon update available! [%s] (US: %u != THEM: %u)\n[%s]\n", details.m_rgchTitle, nAddonTimestamp, details.m_rtimeUpdated, strAddonPath.c_str() );
+			if ( details.m_rtimeUpdated != nAddonTimestamp )
+			{
+				Msg( "Legacy addon update available! [%s] (US: %u != THEM: %u)\n[%s]\n", details.m_rgchTitle, nAddonTimestamp, details.m_rtimeUpdated, strAddonPath.c_str() );
+				info.canUpdate = true;
+				MarkChanged();
+			}
+		}
 	}
 
 	AddAddon( info );
@@ -999,12 +1036,12 @@ void Addon::FileSystem::AddUGCFile( SteamUGCDetails_t details, Addon::AddonType 
 
 void Addon::FileSystem::OnAddonSubscribed( const SteamUGCDetails_t &details )
 {
-	Msg( "Addon::FileSystem::OnAddonSubscribed (%llu)\n", details.m_nPublishedFileId );
+	FS_TRACE( "Addon::FileSystem::OnAddonSubscribed (%llu)\n", details.m_nPublishedFileId );
 }
 
 void Addon::FileSystem::AddUnloadedSubscription( uint64_t wsid )
 {
-	Msg( "Addon::FileSystem::AddUnloadedSubscription (%llu)\n", wsid );
+	FS_TRACE( "Addon::FileSystem::AddUnloadedSubscription (%llu)\n", wsid );
 }
 
 void Addon::FileSystem::EnableLoadingUnloadedAddons()
@@ -1013,25 +1050,25 @@ void Addon::FileSystem::EnableLoadingUnloadedAddons()
 
 bool Addon::FileSystem::HasChanges()
 {
-	Msg( "Addon::FileSystem::HasChanges\n" );
+	FS_TRACE( "Addon::FileSystem::HasChanges\n" );
 	return m_bChanged;
 }
 
 void Addon::FileSystem::MarkChanged()
 {
-	Msg( "Addon::FileSystem::MarkChanged\n" );
+	FS_TRACE( "Addon::FileSystem::MarkChanged\n" );
 	m_bChanged = true;
 }
 
 void Addon::FileSystem::OnAddonDownloaded( const IAddonSystem::Information &info )
 {
-	Msg( "Addon::FileSystem::AddonDownloaded (%llu)\n", info.wsid );
+	FS_TRACE( "Addon::FileSystem::AddonDownloaded (%llu)\n", info.wsid );
 	MarkChanged();
 }
 
 void Addon::FileSystem::OnAddonDownloadFailed( const IAddonSystem::Information &info )
 {
-	Msg( "Addon::FileSystem::OnAddonDownloadFailed (%llu)\n", info.wsid );
+	FS_TRACE( "Addon::FileSystem::OnAddonDownloadFailed (%llu)\n", info.wsid );
 }
 
 void Addon::FileSystem::Load()

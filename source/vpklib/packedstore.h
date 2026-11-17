@@ -11,6 +11,9 @@
 #endif
 
 
+// Before tier0, protected_things.h breaks <chrono> otherwise
+#include "unordered_stuff.h"
+
 #include <tier0/platform.h>
 #include <tier0/threadtools.h>
 #include <tier0/tslist.h>
@@ -25,7 +28,6 @@
 #include "tier1/checksum_md5.h"
 
 #include "sdk_backports.h"
-#include "unordered_stuff.h"
 #include <atomic>
 #include <string>
 #include <utility>

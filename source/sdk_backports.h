@@ -9,6 +9,12 @@
 // RaphaelIT7: Needed for std::size?
 #include <vector>
 
+#include "tier1/convar.h"
+
+// Call traces that stock doesn't print. fs_tellmeyoursecrets 2 shows them
+extern ConVar fs_tellmeyoursecrets;
+#define FS_TRACE( ... ) do { if ( fs_tellmeyoursecrets.GetInt() > 1 ) Msg( __VA_ARGS__ ); } while ( 0 )
+
 // RaphaelIT7:
 // These are some backported functions from
 // https://github.com/Source-Authors/Obsoletium/blob/cf1465256a12f74569ea3e6f4e34daefd9c26c51/public/tier1/strtools.h#L225
