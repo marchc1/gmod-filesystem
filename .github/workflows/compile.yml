@@ -1,109 +1,143 @@
-name: Build DLL
+name: Build
 
-on: 
+on:
   push:
     paths:
       - '.github/workflows/compile.yml'
       - 'source/**'
+      - 'dedicated/**'
       - 'premake5.lua'
+      - 'overrides.lua'
   pull_request:
   workflow_dispatch:
 
+env:
+  GARRYSMOD_COMMON: RaphaelIT7/garrysmod_common
+  GARRYSMOD_COMMON_BRANCH: holylib
+  SOURCESDK_MINIMAL: RaphaelIT7/sourcesdk-minimal
+  SOURCESDK_MINIMAL_BRANCH: patch-7
+  PREMAKE_VERSION: 5.0.0-beta8
+  CONFIG: Release
+
 jobs:
-  build_windows:
-    name: "Build DLL"
-    if: 0
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
-    with:
-      PROJECT_NAME: "filesystem_stdio"
-      BUILD_64x: "true"
-      USE_PREFIX: "false"
-      LINUX_FILEEXTENTION: "so"
-      BUILD_WINDOWS: "true"
-      BUILD_LINUX: "false"
-      ARTIFACT_EXPIRE: "7"
-      SOURCESDK_MINIMAL: "RaphaelIT7/sourcesdk-minimal"
-      SOURCESDK_MINIMAL_BRANCH: "patch-7"
-      SOURCESDK_MINIMAL_64XBRANCH: "x86-64-patch-3"
-      GARRYSMOD_COMMON: "RaphaelIT7/garrysmod_common"
-      GARRYSMOD_COMMON_BRANCH: "holylib"
-      BUILD_CACHE: "true"
-      UPLOAD_PDB: "true"
+  windows:
+    name: Windows x86_64 (${{ matrix.target }})
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Client: filesystem_stdio.dll for the game
+          - target: client
+            premake_args: ''
+            workspace: vs2022
+          # Server: filesystem_stdio.dll built with DEDICATED plus dedicated.dll that loads it
+          - target: dedicated
+            premake_args: '--dedicated'
+            workspace: vs2022_dedicated
+    steps:
+      - uses: actions/checkout@v4
 
-  build_windows_dedicated:
-    name: "Build DLL (Dedicated)"
-    if: false
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
-    with:
-      PROJECT_NAME: "filesystem_stdio"
-      BUILD_64x: "true"
-      USE_PREFIX: "false"
-      LINUX_FILEEXTENTION: "so"
-      BUILD_WINDOWS: "true"
-      BUILD_LINUX: "false"
-      ARTIFACT_EXPIRE: "7"
-      SOURCESDK_MINIMAL: "RaphaelIT7/sourcesdk-minimal"
-      SOURCESDK_MINIMAL_BRANCH: "patch-7"
-      SOURCESDK_MINIMAL_64XBRANCH: "x86-64-patch-3"
-      GARRYSMOD_COMMON: "RaphaelIT7/garrysmod_common"
-      GARRYSMOD_COMMON_BRANCH: "holylib"
-      BUILD_CACHE: "true"
-      UPLOAD_PDB: "true"
-      BUILD_WINDOWS_DEDICATED: "true"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GARRYSMOD_COMMON }}
+          ref: ${{ env.GARRYSMOD_COMMON_BRANCH }}
+          path: garrysmod_common
 
-  build_windows_64x_main:
-    name: "Build DLL (64x - Main Branch)"
-    if: false
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
-    with:
-      PROJECT_NAME: "filesystem_stdio"
-      BUILD_64x: "true"
-      BUILD_32x: "false"
-      USE_PREFIX: "false"
-      LINUX_FILEEXTENTION: "so"
-      BUILD_WINDOWS: "true"
-      BUILD_LINUX: "false"
-      ADDITIONAL_POSTARTIFACTNAME: " - Main branch"
-      ARTIFACT_EXPIRE: "7"
-      SOURCESDK_MINIMAL: "RaphaelIT7/sourcesdk-minimal"
-      SOURCESDK_MINIMAL_64XBRANCH: "patch-7"
-      GARRYSMOD_COMMON: "RaphaelIT7/garrysmod_common"
-      GARRYSMOD_COMMON_BRANCH: "holylib"
-      BUILD_CACHE: "true"
-      UPLOAD_PDB: "true"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCESDK_MINIMAL }}
+          ref: ${{ env.SOURCESDK_MINIMAL_BRANCH }}
+          path: garrysmod_common/sourcesdk-minimal
 
-  build_linux:
-    name: "Build DLL"
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
-    with:
-      PROJECT_NAME: "filesystem_stdio"
-      BUILD_64x: "false" # No 64x for now
-      USE_PREFIX: "false"
-      LINUX_FILEEXTENTION: "so"
-      BUILD_WINDOWS: "false"
-      ARTIFACT_EXPIRE: "7"
-      SOURCESDK_MINIMAL: "RaphaelIT7/sourcesdk-minimal"
-      SOURCESDK_MINIMAL_BRANCH: "patch-7"
-      SOURCESDK_MINIMAL_64XBRANCH: "x86-64-patch-3"
-      GARRYSMOD_COMMON: "RaphaelIT7/garrysmod_common"
-      GARRYSMOD_COMMON_BRANCH: "holylib"
-      BUILD_CACHE: "true"
+      - uses: actions/checkout@v4
+        with:
+          repository: danielga/premake-export-compile-commands
+          path: garrysmod_common/premake/premake-export-compile-commands
 
-  build_ghostinj:
-    name: "Build GhostInj"
-    if: 0
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
-    with:
-      PROJECT_PATH: "ghostinj-dll/"
-      PROJECT_NAME: "ghostinj"
-      BUILD_64x: "true"
-      LINUX_FILEEXTENTION: "dll"
-      BUILD_WINDOWS: "false"
-      USE_PREFIX: "false"
-      ARTIFACT_EXPIRE: "1"
-      SOURCESDK_MINIMAL: "RaphaelIT7/sourcesdk-minimal"
-      SOURCESDK_MINIMAL_BRANCH: "patch-7"
-      SOURCESDK_MINIMAL_64XBRANCH: "x86-64-patch-3"
-      GARRYSMOD_COMMON: "RaphaelIT7/garrysmod_common"
-      GARRYSMOD_COMMON_BRANCH: "holylib"
-      BUILD_CACHE: "true"
+      # Not linked, but garrysmod_common's generator includes their premake files
+      - uses: actions/checkout@v4
+        with:
+          repository: danielga/detouring
+          path: garrysmod_common/detouring
+          submodules: recursive
+
+      - uses: actions/checkout@v4
+        with:
+          repository: danielga/scanning
+          path: garrysmod_common/scanning
+
+      - name: Download premake
+        shell: pwsh
+        run: |
+          curl.exe -fsSL "https://github.com/premake/premake-core/releases/download/v${env:PREMAKE_VERSION}/premake-${env:PREMAKE_VERSION}-windows.zip" -o premake.zip
+          tar -xf premake.zip premake5.exe
+
+      - name: Generate project
+        run: ./premake5.exe --gmcommon=garrysmod_common ${{ matrix.premake_args }} vs2022
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build
+        working-directory: projects/windows/${{ matrix.workspace }}
+        run: msbuild filesystem_stdio.sln /m /p:Configuration=${{ env.CONFIG }} /p:Platform=x64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-${{ matrix.target }}
+          path: |
+            projects/windows/${{ matrix.workspace }}/x86_64/${{ env.CONFIG }}/*.dll
+            projects/windows/${{ matrix.workspace }}/x86_64/${{ env.CONFIG }}/*.pdb
+          if-no-files-found: error
+
+  linux:
+    name: Linux x86_64 (dedicated)
+    runs-on: ubuntu-latest
+    # Older toolchain/glibc than ubuntu-latest so the .so files load on common server distros
+    container: raphaelit7/gmod-builder:latest_64x
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GARRYSMOD_COMMON }}
+          ref: ${{ env.GARRYSMOD_COMMON_BRANCH }}
+          path: garrysmod_common
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCESDK_MINIMAL }}
+          ref: ${{ env.SOURCESDK_MINIMAL_BRANCH }}
+          path: garrysmod_common/sourcesdk-minimal
+
+      - uses: actions/checkout@v4
+        with:
+          repository: danielga/premake-export-compile-commands
+          path: garrysmod_common/premake/premake-export-compile-commands
+
+      # Not linked, but garrysmod_common's generator includes their premake files
+      - uses: actions/checkout@v4
+        with:
+          repository: danielga/detouring
+          path: garrysmod_common/detouring
+          submodules: recursive
+
+      - uses: actions/checkout@v4
+        with:
+          repository: danielga/scanning
+          path: garrysmod_common/scanning
+
+      - name: Generate project
+        run: premake5 --gmcommon=garrysmod_common gmake
+
+      - name: Build
+        working-directory: projects/linux/gmake
+        run: make -j"$(nproc)" config="$(echo "${CONFIG}_x86_64" | tr '[:upper:]' '[:lower:]')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-dedicated
+          path: |
+            projects/linux/gmake/x86_64/${{ env.CONFIG }}/filesystem_stdio.so
+            projects/linux/gmake/x86_64/${{ env.CONFIG }}/dedicated_srv.so
+          if-no-files-found: error
