@@ -10,6 +10,10 @@
 #include <codecvt>
 #include <locale>
 
+#ifdef _WIN32
+#include "winlite.h"
+#endif
+
 static void language_Changed( IConVar* pVar, const char* pOldValue, float fOldValue )
 {
 	if (!g_pFullFileSystem)
@@ -222,23 +226,19 @@ bool CLanguage::GetString( const char *pszPhraseKey, wchar_t *pszPhraseOut, uint
 	return true;
 }
 
-static inline uint16_t ParseHex4( const std::wstring &str, size_t pos )
+static inline uint32_t ParseHexDigit( wchar_t c )
 {
-	uint16_t value = 0;
-	for ( int i=0; i<4; ++i )
-	{
-		wchar_t c = str[pos + i];
-		value <<= 4;
+	if ( c >= L'0' && c <= L'9' )
+		return c - L'0';
 
-		if ( c >= L'0' && c <= L'9' )
-			value |= c - L'0';
-		else if ( c >= L'a' && c <= L'f' )
-			value |= c - L'a' + 10;
-		else if ( c >= L'A' && c <= L'F' )
-			value |= c - L'A' + 10;
-	}
+	if ( c >= L'A' && c <= L'F' )
+		return c - L'A' + 10;
 
-	return value;
+	if ( c >= L'a' && c <= L'f' )
+		return c - L'a' + 10;
+
+	Msg( "Error pasring localization string..\n" );
+	return c;
 }
 
 // RaphaelIT7:
@@ -247,26 +247,43 @@ static inline uint16_t ParseHex4( const std::wstring &str, size_t pos )
 static std::wstring ParseString( const std::string &strInput )
 {
 	wchar_t unicode[4096];
-	size_t unicodeLen = Q_UTF8ToUTF32( strInput.c_str(), (uchar32*)unicode, sizeof(unicode) );
+#ifdef _WIN32
+	MultiByteToWideChar( CP_UTF8, 0, strInput.c_str(), -1, unicode, ARRAYSIZE( unicode ) );
+	unicode[ARRAYSIZE( unicode ) - 1] = L'\0';
+#else
+	Q_UTF8ToWString( strInput.c_str(), unicode, sizeof( unicode ) );
+#endif
 
 	std::wstring strOutput;
-	for ( size_t i=0; i<unicodeLen; ++i )
+	size_t i = 0;
+	while ( unicode[i] != L'\0' )
 	{
-		if ( unicode[i] != U'\\' )
+		if ( unicode[i] != L'\\' )
 		{
 			strOutput.push_back( unicode[i] );
 			++i;
 			continue;
 		}
 
-		if ( unicode[i + 1] == U'u' )
+		if ( unicode[i + 1] == L'u' )
 		{
-			strOutput.push_back( ParseHex4( unicode, i + 2 ) );
-			i += 6;
+			i += 2;
+
+			uint32_t value = 0;
+			for ( int nDigit=0; nDigit<4; ++nDigit )
+			{
+				value = ( value << 4 ) + ParseHexDigit( unicode[i] );
+
+				// GMod reads past the end here
+				if ( unicode[i] != L'\0' )
+					++i;
+			}
+
+			strOutput.push_back( static_cast<wchar_t>( value & 0xFFFF ) );
 			continue;
 		}
 
-		if ( unicode[i + 1] == U'n' )
+		if ( unicode[i + 1] == L'n' )
 		{
 			strOutput.push_back( L'\n' );
 			i += 2;
@@ -282,7 +299,7 @@ static std::wstring ParseString( const std::string &strInput )
 // RaphaelIT7: This is an absolute mess, but so it looks in IDA
 bool CLanguage::ProcessFile( const std::string& strFileName, const char* pathID )
 {
-	CUtlBuffer buffer;
+	CUtlBuffer buffer( 0, 0, CUtlBuffer::TEXT_BUFFER );
 	if ( !g_pFullFileSystem->ReadFile( strFileName.c_str(), pathID, buffer ) )
 	{
 		Warning( "Failed to read language file %s\n", strFileName.c_str() );
@@ -295,7 +312,8 @@ bool CLanguage::ProcessFile( const std::string& strFileName, const char* pathID 
 		return false;
 	}
 
-	std::string strContents(static_cast<const char*>( buffer.Base() ), buffer.TellPut() );
+	const char* pszContents = static_cast<const char*>( buffer.Base() );
+	std::string strContents( pszContents, strnlen( pszContents, buffer.TellPut() ) );
 	std::vector<std::string> lines;
 	Bootil::String::Util::Split( strContents, "\n", lines );
 
@@ -338,7 +356,7 @@ bool CLanguage::ProcessFile( const std::string& strFileName, const char* pathID 
 
 		bContinue = ( slashCount & 1 ) != 0;
 
-		m_Strings[ strCurrentKey ] = ParseString( continuation );
+		m_Strings[ strCurrentKey ] += ParseString( continuation );
 	}
 
 	return true;
