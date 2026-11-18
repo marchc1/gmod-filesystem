@@ -24,6 +24,9 @@
 #include "tier1/convar.h"
 #include "tier1/strtools.h"
 
+// protected_things.h, we don't do VCR
+#undef CreateThread
+
 namespace
 {
 	enum Bucket
@@ -1155,6 +1158,374 @@ namespace
 		Msg( "DylibPatches: DMX name cache on%s\n", g_bDmxNameVerify ? ", verifying every hit" : "" );
 	}
 
+	// Lua refresh's folder watcher walks every folder just to find symlinks, Windows covers the rest.
+	// The walk moves to a thread, the watcher gets restarted with the links on the next poll
+	enum class LuaWatchMode
+	{
+		Normal,
+		SkipWalk,
+		Worker,
+		ReplayLinks,
+	};
+
+	struct LuaWatchJob
+	{
+		void *m_pMonitor = nullptr;
+		std::string m_Path;
+		std::vector<std::string> m_Filter;
+		bool m_bHasFilter = false;
+		std::vector<std::string> m_Links;
+		std::atomic<bool> m_bReady{ false };
+	};
+
+	using LuaWatchFolderFn = void ( * )( void *pThis, const std::string *pPath, bool bSubtree, const std::vector<std::string> *pFilter );
+	using LuaWatchRecurseFn = void ( * )( std::vector<std::string> *pOut, const std::string *pPath, const std::vector<std::string> *pFilter );
+	using LuaWatchHasChangesFn = bool ( * )( void *pThis );
+	using FindFirstFileExAFn = HANDLE( WINAPI * )( LPCSTR, FINDEX_INFO_LEVELS, LPVOID, FINDEX_SEARCH_OPS, LPVOID, DWORD );
+	using FindNextFileAFn = BOOL( WINAPI * )( HANDLE, LPWIN32_FIND_DATAA );
+
+	LuaWatchFolderFn g_pfnLuaWatchFolder = nullptr;
+	LuaWatchRecurseFn g_pfnLuaWatchRecurse = nullptr;
+	LuaWatchHasChangesFn g_pfnLuaWatchHasChanges = nullptr;
+	FindFirstFileExAFn g_pfnWatchFindFirst = nullptr;
+	FindNextFileAFn g_pfnWatchFindNext = nullptr;
+
+	std::atomic<LuaWatchJob *> g_pLuaWatchJob{ nullptr };
+	bool g_bLuaWatchInstalled = false;
+	std::atomic<int64_t> g_nLuaWatchDirs{ 0 };
+	std::atomic<int64_t> g_nLuaWatchLinks{ 0 };
+	std::atomic<int64_t> g_nLuaWatchWalkUs{ 0 };
+	std::atomic<int64_t> g_nLuaWatchMergeUs{ 0 };
+	std::atomic<int64_t> g_nLuaWatchMerges{ 0 };
+	std::atomic<int64_t> g_nLuaWatchChangePolls{ 0 };
+	std::atomic<LuaWatchJob *> g_pLuaWatchMerged{ nullptr };
+
+	thread_local LuaWatchMode t_LuaWatchMode = LuaWatchMode::Normal;
+	thread_local const std::vector<std::string> *t_pLuaWatchLinks = nullptr;
+	thread_local std::unordered_map<std::string, DWORD> *t_pLuaWatchAttributes = nullptr;
+	thread_local std::string *t_pLuaWatchPrefix = nullptr;
+
+	int64_t TicksToUs( int64_t nTicks )
+	{
+		LARGE_INTEGER frequency;
+		QueryPerformanceFrequency( &frequency );
+		return nTicks * 1000000 / frequency.QuadPart;
+	}
+
+	void NoteWatchFindData( const WIN32_FIND_DATAA *pData )
+	{
+		if ( pData->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY )
+			( *t_pLuaWatchAttributes )[*t_pLuaWatchPrefix + pData->cFileName] = pData->dwFileAttributes;
+	}
+
+	HANDLE WINAPI Hook_WatchFindFirst( LPCSTR pName, FINDEX_INFO_LEVELS level, LPVOID pData, FINDEX_SEARCH_OPS op, LPVOID pFilter, DWORD nFlags )
+	{
+		if ( t_LuaWatchMode != LuaWatchMode::Worker )
+			return g_pfnWatchFindFirst( pName, level, pData, op, pFilter, nFlags );
+
+		HANDLE hFind = g_pfnWatchFindFirst( pName, FindExInfoBasic, pData, op, pFilter, nFlags | FIND_FIRST_EX_LARGE_FETCH );
+		if ( hFind != INVALID_HANDLE_VALUE )
+		{
+			t_pLuaWatchPrefix->assign( pName );
+			if ( !t_pLuaWatchPrefix->empty() && t_pLuaWatchPrefix->back() == '*' )
+				t_pLuaWatchPrefix->pop_back();
+
+			NoteWatchFindData( static_cast<const WIN32_FIND_DATAA *>( pData ) );
+		}
+
+		return hFind;
+	}
+
+	BOOL WINAPI Hook_WatchFindNext( HANDLE hFind, LPWIN32_FIND_DATAA pData )
+	{
+		BOOL bResult = g_pfnWatchFindNext( hFind, pData );
+		if ( bResult && t_LuaWatchMode == LuaWatchMode::Worker )
+			NoteWatchFindData( pData );
+
+		return bResult;
+	}
+
+	DWORD WINAPI LuaWatchThread( LPVOID pParam )
+	{
+		auto *pJob = static_cast<LuaWatchJob *>( pParam );
+		SetThreadPriority( GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN );
+
+		int64_t nStart = Now();
+		std::unordered_map<std::string, DWORD> attributes;
+		std::string prefix;
+		t_pLuaWatchAttributes = &attributes;
+		t_pLuaWatchPrefix = &prefix;
+		t_LuaWatchMode = LuaWatchMode::Worker;
+
+		std::vector<std::string> dirs;
+		g_pfnLuaWatchRecurse( &dirs, &pJob->m_Path, pJob->m_bHasFilter ? &pJob->m_Filter : nullptr );
+
+		for ( const std::string &dir : dirs )
+		{
+			auto it = attributes.find( dir );
+			DWORD nAttributes = it != attributes.end() ? it->second : GetFileAttributesA( dir.c_str() );
+			if ( nAttributes & FILE_ATTRIBUTE_REPARSE_POINT )
+				pJob->m_Links.push_back( dir );
+		}
+
+		g_nLuaWatchDirs = int64_t( dirs.size() );
+		g_nLuaWatchLinks = int64_t( pJob->m_Links.size() );
+		g_nLuaWatchWalkUs = TicksToUs( Now() - nStart );
+		pJob->m_bReady.store( true, std::memory_order_release );
+		return 0;
+	}
+
+	void Hook_LuaWatchRecurse( std::vector<std::string> *pOut, const std::string *pPath, const std::vector<std::string> *pFilter )
+	{
+		switch ( t_LuaWatchMode )
+		{
+		case LuaWatchMode::SkipWalk:
+			return;
+
+		case LuaWatchMode::ReplayLinks:
+			for ( const std::string &link : *t_pLuaWatchLinks )
+				pOut->push_back( link );
+			return;
+
+		default:
+			g_pfnLuaWatchRecurse( pOut, pPath, pFilter );
+		}
+	}
+
+	void Hook_LuaWatchFolder( void *pThis, const std::string *pPath, bool bSubtree, const std::vector<std::string> *pFilter )
+	{
+		if ( !bSubtree )
+		{
+			g_pLuaWatchJob.store( nullptr, std::memory_order_release );
+			g_pfnLuaWatchFolder( pThis, pPath, bSubtree, pFilter );
+			return;
+		}
+
+		auto *pJob = new LuaWatchJob;
+		pJob->m_pMonitor = pThis;
+		pJob->m_Path = *pPath;
+		pJob->m_bHasFilter = pFilter != nullptr;
+		if ( pFilter )
+			pJob->m_Filter = *pFilter;
+
+		HANDLE hThread = CreateThread( nullptr, 0, &LuaWatchThread, pJob, CREATE_SUSPENDED, nullptr );
+		if ( !hThread )
+		{
+			delete pJob;
+			g_pLuaWatchJob.store( nullptr, std::memory_order_release );
+			g_pfnLuaWatchFolder( pThis, pPath, bSubtree, pFilter );
+			return;
+		}
+
+		t_LuaWatchMode = LuaWatchMode::SkipWalk;
+		g_pfnLuaWatchFolder( pThis, pPath, bSubtree, pFilter );
+		t_LuaWatchMode = LuaWatchMode::Normal;
+
+		// Older jobs are left alone, their thread might still be using them
+		g_pLuaWatchJob.store( pJob, std::memory_order_release );
+		ResumeThread( hThread );
+		CloseHandle( hThread );
+	}
+
+	// Closing a watched folder with a read pending would complete it into freed memory
+	void StopLuaWatchIO( void *pThis )
+	{
+		constexpr size_t kWatcherSize = 0x448;
+		constexpr size_t kHandleOffset = 0x20;
+		constexpr size_t kOverlappedOffset = 0x28;
+
+		auto *pList = *static_cast<uint8_t ***>( pThis );
+		if ( !pList )
+			return;
+
+		for ( uint8_t *pWatcher = pList[0]; pWatcher != pList[1]; pWatcher += kWatcherSize )
+		{
+			HANDLE hDir = *reinterpret_cast<HANDLE *>( pWatcher + kHandleOffset );
+			auto *pOverlapped = reinterpret_cast<OVERLAPPED *>( pWatcher + kOverlappedOffset );
+			if ( hDir && hDir != INVALID_HANDLE_VALUE && !HasOverlappedIoCompleted( pOverlapped ) )
+			{
+				DWORD nBytes;
+				if ( CancelIoEx( hDir, pOverlapped ) || GetLastError() != ERROR_NOT_FOUND )
+					GetOverlappedResult( hDir, pOverlapped, &nBytes, TRUE );
+			}
+
+			if ( pOverlapped->hEvent )
+			{
+				CloseHandle( pOverlapped->hEvent );
+				pOverlapped->hEvent = nullptr;
+			}
+		}
+	}
+
+	bool Hook_LuaWatchHasChanges( void *pThis )
+	{
+		bool bChanges = g_pfnLuaWatchHasChanges( pThis );
+		if ( bChanges )
+			BumpStat( g_nLuaWatchChangePolls );
+
+		LuaWatchJob *pJob = g_pLuaWatchJob.load( std::memory_order_acquire );
+		if ( !pJob || pJob->m_pMonitor != pThis || !pJob->m_bReady.load( std::memory_order_acquire ) )
+			return bChanges;
+
+		g_pLuaWatchJob.store( nullptr, std::memory_order_release );
+
+		int64_t nStart = Now();
+		StopLuaWatchIO( pThis );
+
+		t_pLuaWatchLinks = &pJob->m_Links;
+		t_LuaWatchMode = LuaWatchMode::ReplayLinks;
+		g_pfnLuaWatchFolder( pThis, &pJob->m_Path, true, pJob->m_bHasFilter ? &pJob->m_Filter : nullptr );
+		t_LuaWatchMode = LuaWatchMode::Normal;
+		t_pLuaWatchLinks = nullptr;
+
+		g_nLuaWatchMergeUs = TicksToUs( Now() - nStart );
+		++g_nLuaWatchMerges;
+		g_pLuaWatchMerged.store( pJob, std::memory_order_release );
+
+		return g_pfnLuaWatchHasChanges( pThis ) || bChanges;
+	}
+
+	void **FindImportSlot( HMODULE hModule, const char *pDll, const char *pName )
+	{
+		auto *pBase = reinterpret_cast<uint8_t *>( hModule );
+		auto *pNt = reinterpret_cast<IMAGE_NT_HEADERS *>( pBase + reinterpret_cast<IMAGE_DOS_HEADER *>( pBase )->e_lfanew );
+		const IMAGE_DATA_DIRECTORY &dir = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+
+		auto *pImport = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR *>( pBase + dir.VirtualAddress );
+		for ( ; pImport->Name; ++pImport )
+		{
+			if ( V_stricmp( reinterpret_cast<const char *>( pBase + pImport->Name ), pDll ) || !pImport->OriginalFirstThunk )
+				continue;
+
+			auto *pNames = reinterpret_cast<IMAGE_THUNK_DATA *>( pBase + pImport->OriginalFirstThunk );
+			auto *pSlots = reinterpret_cast<IMAGE_THUNK_DATA *>( pBase + pImport->FirstThunk );
+			for ( ; pNames->u1.AddressOfData; ++pNames, ++pSlots )
+			{
+				if ( IMAGE_SNAP_BY_ORDINAL( pNames->u1.Ordinal ) )
+					continue;
+
+				auto *pByName = reinterpret_cast<IMAGE_IMPORT_BY_NAME *>( pBase + pNames->u1.AddressOfData );
+				if ( !strcmp( reinterpret_cast<const char *>( pByName->Name ), pName ) )
+					return reinterpret_cast<void **>( &pSlots->u1.Function );
+			}
+		}
+
+		return nullptr;
+	}
+
+	bool PatchImportSlot( void **ppSlot, void *pHook, void **ppOriginal )
+	{
+		DWORD nOldProtect;
+		if ( !VirtualProtect( ppSlot, sizeof( void * ), PAGE_READWRITE, &nOldProtect ) )
+			return false;
+
+		*ppOriginal = *ppSlot;
+		*ppSlot = pHook;
+		VirtualProtect( ppSlot, sizeof( void * ), nOldProtect, &nOldProtect );
+		return true;
+	}
+
+	bool MatchesAt( const Range &text, const uint8_t *pAddress, const int16_t *pPattern, size_t nSize )
+	{
+		if ( pAddress < text.m_pStart || pAddress + nSize > text.m_pStart + text.m_nSize )
+			return false;
+
+		for ( size_t i = 0; i < nSize; ++i )
+		{
+			if ( pPattern[i] >= 0 && pAddress[i] != pPattern[i] )
+				return false;
+		}
+
+		return true;
+	}
+
+	void InstallLuaWatch( HMODULE hServer )
+	{
+		if ( CommandLine()->CheckParm( "-noluawatchthread" ) )
+			return;
+
+		static const int16_t kWatchFolder[] = {
+			0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0xAC, 0x24, 0xF0, 0xF7, 0xFF, 0xFF,
+			0x48, 0x81, 0xEC, 0x10, 0x09, 0x00, 0x00, 0x48, 0x8B, 0x05, -1, -1, -1, -1, 0x48, 0x33, 0xC4, 0x48, 0x89, 0x85, 0x00,
+		};
+		static const int16_t kRecurseCall[] = {
+			0x48, 0x89, 0x7C, 0x24, 0x50, 0x4D, 0x8B, 0xC7, 0x48, 0x8B, 0xD3, 0x48, 0x8D, 0x4C, 0x24, 0x40, 0xE8,
+		};
+		static const int16_t kRecurse[] = {
+			0x48, 0x89, 0x5C, 0x24, 0x20, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+		};
+		static const int16_t kHasChanges[] = {
+			0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0xE8, -1, -1, -1, -1,
+			0x48, 0x83, 0x7B, 0x30, 0x00, 0x0F, 0x97, 0xC0, 0x48, 0x83, 0xC4, 0x20, 0x5B, 0xC3,
+		};
+		constexpr ptrdiff_t kRecurseCallOffset = 0x234;
+		constexpr ptrdiff_t kHasChangesOffset = -0x760;
+
+		Range text = FindSection( hServer, ".text" );
+		const uint8_t *pWatchFolder = FindUniquePattern( text, kWatchFolder, sizeof( kWatchFolder ) / sizeof( kWatchFolder[0] ) );
+		if ( !pWatchFolder )
+		{
+			Warning( "DylibPatches: Lua watch thread is off, WatchFolder not found\n" );
+			return;
+		}
+
+		const uint8_t *pCallSite = pWatchFolder + kRecurseCallOffset;
+		const uint8_t *pHasChanges = pWatchFolder + kHasChangesOffset;
+		if ( !MatchesAt( text, pCallSite, kRecurseCall, sizeof( kRecurseCall ) / sizeof( kRecurseCall[0] ) )
+			|| !MatchesAt( text, pHasChanges, kHasChanges, sizeof( kHasChanges ) / sizeof( kHasChanges[0] ) ) )
+		{
+			Warning( "DylibPatches: Lua watch thread is off, server.dll doesn't match\n" );
+			return;
+		}
+
+		const uint8_t *pRecurse = CallTarget( pCallSite + sizeof( kRecurseCall ) / sizeof( kRecurseCall[0] ) - 1 );
+		if ( !MatchesAt( text, pRecurse, kRecurse, sizeof( kRecurse ) / sizeof( kRecurse[0] ) ) )
+		{
+			Warning( "DylibPatches: Lua watch thread is off, the folder walk doesn't match\n" );
+			return;
+		}
+
+		void **ppFindFirst = FindImportSlot( hServer, "KERNEL32.dll", "FindFirstFileExA" );
+		void **ppFindNext = FindImportSlot( hServer, "KERNEL32.dll", "FindNextFileA" );
+		if ( !ppFindFirst || !ppFindNext )
+		{
+			Warning( "DylibPatches: Lua watch thread is off, find imports not found\n" );
+			return;
+		}
+
+		// Stays loaded for the worker thread
+		HMODULE hPinned;
+		GetModuleHandleExA( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCSTR>( pWatchFolder ), &hPinned );
+		PinSelf();
+
+		if ( !PatchImportSlot( ppFindFirst, reinterpret_cast<void *>( &Hook_WatchFindFirst ), reinterpret_cast<void **>( &g_pfnWatchFindFirst ) )
+			|| !PatchImportSlot( ppFindNext, reinterpret_cast<void *>( &Hook_WatchFindNext ), reinterpret_cast<void **>( &g_pfnWatchFindNext ) ) )
+		{
+			Warning( "DylibPatches: Lua watch thread is off, couldn't patch imports\n" );
+			return;
+		}
+
+		std::vector<Detouring::Hook *> hooks;
+		bool bOk = InstallHook( const_cast<uint8_t *>( pRecurse ), reinterpret_cast<void *>( &Hook_LuaWatchRecurse ), reinterpret_cast<void **>( &g_pfnLuaWatchRecurse ), hooks )
+			&& InstallHook( const_cast<uint8_t *>( pHasChanges ), reinterpret_cast<void *>( &Hook_LuaWatchHasChanges ), reinterpret_cast<void **>( &g_pfnLuaWatchHasChanges ), hooks )
+			&& InstallHook( const_cast<uint8_t *>( pWatchFolder ), reinterpret_cast<void *>( &Hook_LuaWatchFolder ), reinterpret_cast<void **>( &g_pfnLuaWatchFolder ), hooks );
+
+		for ( size_t i = 0; bOk && i < hooks.size(); ++i )
+			bOk = hooks[i]->Enable();
+
+		if ( !bOk )
+		{
+			for ( Detouring::Hook *pHook : hooks )
+				pHook->Destroy();
+
+			Warning( "DylibPatches: Lua watch thread is off, hooking failed\n" );
+			return;
+		}
+
+		g_bLuaWatchInstalled = true;
+		Msg( "DylibPatches: Lua watch walk moved to a thread\n" );
+	}
+
 	// Timing for CParticleSystemMgr::ReadParticleConfigFile
 	struct ParticleLoad
 	{
@@ -1421,6 +1792,16 @@ CON_COMMAND( filesystem_luatiming, "Prints where Lua startup time went and write
 		g_bDmxNameCacheInstalled ? "on" : "off",
 		g_nDmxNameHits.load(), g_nDmxNameMisses.load(), g_nDmxNameVerified.load(), g_nDmxNameMismatches.load() );
 
+	Msg( "Lua watch thread: %s, %lld folders, %lld links, walk %.1f ms, %lld merges, last merge %.1f ms, %lld polls saw changes\n",
+		g_bLuaWatchInstalled ? "on" : "off", g_nLuaWatchDirs.load(), g_nLuaWatchLinks.load(),
+		g_nLuaWatchWalkUs.load() / 1000.0, g_nLuaWatchMerges.load(), g_nLuaWatchMergeUs.load() / 1000.0, g_nLuaWatchChangePolls.load() );
+
+	if ( LuaWatchJob *pMerged = g_pLuaWatchMerged.load( std::memory_order_acquire ) )
+	{
+		for ( const std::string &link : pMerged->m_Links )
+			Msg( "  watching link %s\n", link.c_str() );
+	}
+
 	WriteParticleReport();
 
 	if ( !g_pState )
@@ -1460,6 +1841,13 @@ void DylibPatches::OnModuleLoaded( const char *pFileName, CSysModule *pModule )
 		InstallLuaNoCompress( hModule );
 		InstallParticleTiming( hModule );
 		InstallDmxNameCache( hModule );
+	}
+
+	static bool s_bServer = false;
+	if ( !s_bServer && !V_stricmp( pName, "server.dll" ) )
+	{
+		s_bServer = true;
+		InstallLuaWatch( hModule );
 	}
 }
 
