@@ -18,8 +18,15 @@ if not DEVELOPMENT then
 		description = "Build for dedicated server (defines DEDICATED)"
 	})
 
+	newoption({
+		trigger = "external-dylib-patches",
+		description = "Patch other game dlls as they load (Windows x64 client only)"
+	})
+
 	DEDICATED = _OPTIONS["dedicated"] and true or false
 end
+
+EXTERNAL_DYLIB_PATCHES = _OPTIONS["external-dylib-patches"] and not DEDICATED
 
 local gmcommon = assert(_OPTIONS.gmcommon or os.getenv("GARRYSMOD_COMMON"),
 	"you didn't provide a path to your garrysmod_common (https://github.com/danielga/garrysmod_common) directory")
@@ -43,6 +50,8 @@ include(sourcePath .. "bootil/premake5.lua")
 local workspacePath = nil
 if DEDICATED then
 	workspacePath = (_OPTIONS["workspace"] or WORKSPACE_DIRECTORY) .. "_dedicated"
+elseif EXTERNAL_DYLIB_PATCHES then
+	workspacePath = (_OPTIONS["workspace"] or WORKSPACE_DIRECTORY) .. "_patches"
 end
 
 CreateWorkspace({name = "filesystem_stdio", abi_compatible = true, path = workspacePath})
@@ -76,6 +85,10 @@ CreateWorkspace({name = "filesystem_stdio", abi_compatible = true, path = worksp
 		--IncludeDetouring()
 		--IncludeScanning()
 		IncludeBootil()
+
+		if EXTERNAL_DYLIB_PATCHES then
+			IncludeDetouring()
+		end
 
 		if DEDICATED then
 			defines("SWDS=1")
@@ -128,6 +141,11 @@ CreateWorkspace({name = "filesystem_stdio", abi_compatible = true, path = worksp
 				defines("DEDICATED")
 			else
 				defines("NOT_DEDICATED") -- client build
+			end
+
+			if EXTERNAL_DYLIB_PATCHES then
+				filter({"system:windows", "platforms:x86_64"})
+					defines("EXTERNAL_DYLIB_PATCHES")
 			end
 
 		filter("system:windows")

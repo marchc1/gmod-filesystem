@@ -20,6 +20,7 @@
 #include "packfile.h"
 #include "foldercache.h"
 #include "pathresolver.h"
+#include "dylibpatches.h"
 
 #ifdef POSIX
 #include "linux_support.h"
@@ -5052,6 +5053,14 @@ void CBaseFileSystem::CSearchPathsIterator::CopySearchPaths( const CUtlLinkedLis
 	}
 }
 
+static CSysModule *FinishLoadModule( const char *pFileName, CSysModule *pModule )
+{
+#ifdef EXTERNAL_DYLIB_PATCHES
+	DylibPatches::OnModuleLoaded( pFileName, pModule );
+#endif
+	return pModule;
+}
+
 //-----------------------------------------------------------------------------
 // Purpose: Load/unload a DLL
 //-----------------------------------------------------------------------------
@@ -5062,7 +5071,7 @@ CSysModule *CBaseFileSystem::LoadModule( const char *pFileName, const char *pPat
 	// dimhotepus: Load directly by system if absolute path.
 	if ( V_IsAbsolutePath( pFileName ) )
 	{
-		return Sys_LoadModule( pFileName );
+		return FinishLoadModule( pFileName, Sys_LoadModule( pFileName ) );
 	}
 
 	LogFileAccess( pFileName );
@@ -5091,7 +5100,7 @@ CSysModule *CBaseFileSystem::LoadModule( const char *pFileName, const char *pPat
 		if ( pModule ) 
 		{
 			// we found the binary in one of our search paths
-			return pModule;
+			return FinishLoadModule( pFileName, pModule );
 		}
 	}
 
@@ -5099,7 +5108,7 @@ CSysModule *CBaseFileSystem::LoadModule( const char *pFileName, const char *pPat
 	// RaphaelIT7:
 	// In Obsoletium they return a nullptr BUT GMod depends on the behavior of Sys_LoadModule being attempted!
 	// This is due to GMod failing to properly add GAMEBIN for the bin/ folder as it only adds GAMEBIN for garrysmod/bin/
-	return Sys_LoadModule( pFileName );
+	return FinishLoadModule( pFileName, Sys_LoadModule( pFileName ) );
 }
 
 //-----------------------------------------------------------------------------

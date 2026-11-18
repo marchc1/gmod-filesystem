@@ -13,6 +13,11 @@ newoption({
 	description = "Build for Windows dedicated server (defines DEDICATED)"
 })
 
+newoption({
+	trigger = "external-dylib-patches",
+	description = "Patch other game dlls as they load (Windows x64 client only)"
+})
+
 DEVELOPMENT = true
 DEDICATED = _OPTIONS["dedicated"] and true or false
 load(io.readfile("../../premake5.lua"))()
