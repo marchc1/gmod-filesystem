@@ -5,7 +5,7 @@
 #include "filesystem.h"
 #include "tier0/dbg.h"
 #include "tier0/icommandline.h"
-#include "Color.h"
+#include "color.h"
 #include "tier1/keyvalues.h"
 #include "tier1/strtools.h"
 #include "tier1/utlbuffer.h"

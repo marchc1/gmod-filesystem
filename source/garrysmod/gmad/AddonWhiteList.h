@@ -3,6 +3,7 @@
 #define ADDONWHITELIST_H
 
 #include "Bootil/Bootil.h"
+#include <cstdint>
 
 namespace Addon
 {
