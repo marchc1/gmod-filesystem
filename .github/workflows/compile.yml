@@ -2,6 +2,9 @@ name: Build
 
 on:
   push:
+    branches: ['**']
+    # v* tags publish a release. Path filters don't apply to tags
+    tags: ['v*']
     paths:
       - '.github/workflows/compile.yml'
       - 'source/**'
@@ -11,28 +14,32 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   GARRYSMOD_COMMON: RaphaelIT7/garrysmod_common
   GARRYSMOD_COMMON_BRANCH: holylib
   SOURCESDK_MINIMAL: RaphaelIT7/sourcesdk-minimal
   SOURCESDK_MINIMAL_BRANCH: patch-7
   PREMAKE_VERSION: 5.0.0-beta8
+  PREMAKE_SHA256: e64ce2ed8778e0098f63674cca61fe33941b5f0c8d9a4afd651152bdea3758ab
   CONFIG: Release
 
 jobs:
   windows:
-    name: Windows x86_64 (${{ matrix.target }})
+    name: ${{ matrix.package }}
     runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Client: filesystem_stdio.dll for the game
-          - target: client
+          # filesystem_stdio.dll
+          - package: win64_client
             premake_args: ''
             workspace: vs2022
-          # Server: filesystem_stdio.dll built with DEDICATED plus dedicated.dll that loads it
-          - target: dedicated
+          # dedicated.dll + server filesystem_stdio.dll
+          - package: win64_srcds
             premake_args: '--dedicated'
             workspace: vs2022_dedicated
     steps:
@@ -71,6 +78,8 @@ jobs:
         shell: pwsh
         run: |
           curl.exe -fsSL "https://github.com/premake/premake-core/releases/download/v${env:PREMAKE_VERSION}/premake-${env:PREMAKE_VERSION}-windows.zip" -o premake.zip
+          $hash = (Get-FileHash premake.zip -Algorithm SHA256).Hash
+          if ($hash -ne $env:PREMAKE_SHA256) { throw "premake.zip hash mismatch: $hash" }
           tar -xf premake.zip premake5.exe
 
       - name: Generate project
@@ -84,17 +93,27 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-x86_64-${{ matrix.target }}
-          path: |
-            projects/windows/${{ matrix.workspace }}/x86_64/${{ env.CONFIG }}/*.dll
-            projects/windows/${{ matrix.workspace }}/x86_64/${{ env.CONFIG }}/*.pdb
+          name: ${{ matrix.package }}
+          path: projects/windows/${{ matrix.workspace }}/x86_64/${{ env.CONFIG }}/*.dll
           if-no-files-found: error
 
   linux:
-    name: Linux x86_64 (dedicated)
+    name: ${{ matrix.package }}
     runs-on: ubuntu-latest
     # Older toolchain/glibc than ubuntu-latest so the .so files load on common server distros
     container: raphaelit7/gmod-builder:latest_64x
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # filesystem_stdio.so
+          - package: linux64_client
+            premake_args: ''
+            workspace: gmake
+          # dedicated_srv.so + server filesystem_stdio.so
+          - package: linux64_srcds
+            premake_args: '--dedicated'
+            workspace: gmake_dedicated
     steps:
       - uses: actions/checkout@v4
 
@@ -115,7 +134,6 @@ jobs:
           repository: danielga/premake-export-compile-commands
           path: garrysmod_common/premake/premake-export-compile-commands
 
-      # Not linked, but garrysmod_common's generator includes their premake files
       - uses: actions/checkout@v4
         with:
           repository: danielga/detouring
@@ -128,16 +146,50 @@ jobs:
           path: garrysmod_common/scanning
 
       - name: Generate project
-        run: premake5 --gmcommon=garrysmod_common gmake
+        run: premake5 --gmcommon=garrysmod_common ${{ matrix.premake_args }} gmake
 
       - name: Build
-        working-directory: projects/linux/gmake
+        working-directory: projects/linux/${{ matrix.workspace }}
         run: make -j"$(nproc)" config="$(echo "${CONFIG}_x86_64" | tr '[:upper:]' '[:lower:]')"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-x86_64-dedicated
-          path: |
-            projects/linux/gmake/x86_64/${{ env.CONFIG }}/filesystem_stdio.so
-            projects/linux/gmake/x86_64/${{ env.CONFIG }}/dedicated_srv.so
+          name: ${{ matrix.package }}
+          path: projects/linux/${{ matrix.workspace }}/x86_64/${{ env.CONFIG }}/*.so
           if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Zip
+        run: |
+          mkdir out
+          for dir in dist/*/; do
+            name="$(basename "$dir")"
+            (cd "$dir" && zip -9 "$GITHUB_WORKSPACE/out/$name.zip" *)
+          done
+          unzip -l 'out/*.zip'
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: out/*.zip
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=""
+          case "$GITHUB_REF_NAME" in *-*) flags="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" out/*.zip \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes $flags

@@ -15,7 +15,7 @@ if not DEVELOPMENT then
 
 	newoption({
 		trigger = "dedicated",
-		description = "Build for Windows dedicated server (defines DEDICATED)"
+		description = "Build for dedicated server (defines DEDICATED)"
 	})
 
 	DEDICATED = _OPTIONS["dedicated"] and true or false
@@ -119,28 +119,30 @@ CreateWorkspace({name = "filesystem_stdio", abi_compatible = true, path = worksp
 		filter({"platforms:x86_64"})
 			defines("PLATFORM_64BITS")
 
-		filter("system:windows")
-			removefiles(sourcePath .. "linux_support.cpp")
+		filter({})
 			if DEDICATED then
 				defines("DEDICATED")
 			else
-				defines("NOT_DEDICATED") -- Windows client build
+				defines("NOT_DEDICATED") -- client build
 			end
+
+		filter("system:windows")
+			removefiles(sourcePath .. "linux_support.cpp")
 
 		filter("system:linux")
 			files(sourcePath .. "tier0/platform_posix.cpp")
 			disablewarnings({"unused-variable"})
 			targetextension(".so")
 			links({"dl", "pthread"}) -- this fixes the undefined reference to `dlopen' errors. tier0 comes from IncludeSDKTier0
-			defines({"DEDICATED", "POSIX"}) -- All linux build focus Linux dedicated servers.
+			defines({"POSIX"})
 
 	--[[
 		Replacement for dedicated.dll / dedicated_srv.so.
 		Stock has the whole filesystem compiled in, ours loads filesystem_stdio next to it.
-		Windows only builds it with --dedicated, every Linux build is a server build.
+		Only built with --dedicated
 	]]
 	filter({})
-	if DEDICATED or os.istarget("linux") then
+	if DEDICATED then
 		CreateProject({serverside = true, manual_files = true, source_path = rootDir .. "dedicated", name = "dedicated"})
 			kind("SharedLib")
 			symbols("On")
