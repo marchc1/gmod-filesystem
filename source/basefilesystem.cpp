@@ -6135,9 +6135,13 @@ void CBaseFileSystem::GMOD_SetupDefaultPaths( const char *pszGamePath, const cha
 	// Engine
 	//
 #ifdef PLATFORM_64BITS
-	// x64 GMod: the 64 bit client/server dlls live in bin/win64, bin/ has the 32 bit ones.
+	// x64 GMod: the 64 bit client/server dlls live in bin/win64 (bin/linux64), bin/ has the 32 bit ones.
 	// Stock x64 doesn't add EXECUTABLE_PATH here either
+#ifdef _WIN32
 	AddSearchPath( ( m_strModPath + "/bin/win64" ).c_str(), "GAMEBIN", PRIORITY_GROUP_TAIL( GN_ENGINECORE ) );
+#else
+	AddSearchPath( ( m_strModPath + "/bin/linux64" ).c_str(), "GAMEBIN", PRIORITY_GROUP_TAIL( GN_ENGINECORE ) );
+#endif
 #else
 	AddSearchPath( ( m_strModPath + "/bin" ).c_str(), "GAMEBIN", PRIORITY_GROUP_TAIL( GN_ENGINECORE ) );
 	AddSearchPath( ( m_strGamePath ).c_str(), "EXECUTABLE_PATH", PRIORITY_GROUP_TAIL( GN_ENGINECORE ) );

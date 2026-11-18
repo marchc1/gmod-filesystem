@@ -128,7 +128,6 @@ int GameDepot::System::GetRefreshCount()
 GameDepot::System::System()
 {
 	m_RefreshCount = 0;
-	FS_TRACE( "GameDepot::System::System()\n" );
 }
 
 void GameDepot::System::FindGame( std::string &strGameName )

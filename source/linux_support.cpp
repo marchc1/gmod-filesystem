@@ -26,50 +26,38 @@ thread_local char selectBuf[PATH_MAX];
 int FileSelect( const dirent *ent )
 {
 	const char *mask{selectBuf}, *name{ent->d_name};
+	const char *starMask{nullptr}, *starName{nullptr};
 
 	if (V_streq(name, ".") || V_streq(name, "..") ) return 0;
 	if (V_streq(selectBuf, "*.*")) return 1;
 
-	while (*mask && *name)
+	while (*name)
 	{
 		if (*mask == '*')
 		{
-			mask++; // move to the next char in the mask
-
-			// if this is the end of the mask its a match
-			if (!*mask) return 1;
-
-			// dimhotepus: toupper -> V_toupper.
-			// while the two don't meet up again
-			while (*name && V_toupper(*name) != V_toupper(*mask)) 
-			{
-				name++;
-			}
-
-			// end of the name
-			if (!*name) break; 
+			starMask = ++mask;
+			starName = name;
 		}
-		else if (*mask != '?')
-		{
-			// dimhotepus: toupper -> V_toupper.
-			// mismatched!
-			if (V_toupper(*mask) != V_toupper(*name)) return 0;
-
-			mask++;
-			name++;
-
-			// if its at the end of the buffer
-			if (!*mask && !*name) return 1;
-		}
-		else /* mask is "?", we don't care*/
+		else if (*mask && (*mask == '?' || V_toupper(*mask) == V_toupper(*name)))
 		{
 			mask++;
 			name++;
+		}
+		else if (starMask)
+		{
+			// retry with the last * eating one more char
+			mask = starMask;
+			name = ++starName;
+		}
+		else
+		{
+			return 0;
 		}
 	}
 
-	// both of the strings are at the end
-	return !*mask && !*name;
+	while (*mask == '*') mask++;
+
+	return !*mask;
 }
 
 int FillDataStruct( FIND_DATA *dat )
@@ -143,7 +131,7 @@ HANDLE FindFirstFile( const char *fileName, FIND_DATA *dat )
 	{
 		// dimhotepus: Speedup root dir computation.
 		const bool isRoot = !Q_isempty(dir) && dir[0] == '/' && dir[1] == '\0';
-		V_strcpy_safe(selectBuf, fileName + (isRoot ? 0 : 1) + 1);
+		V_strcpy_safe(selectBuf, fileName + (isRoot ? 0 : V_strlen(dir)) + 1);
 
 		dat->namelist = nullptr;
 		V_strcpy_safe(dat->cBaseDir, dir);

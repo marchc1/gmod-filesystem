@@ -46,6 +46,10 @@ if DEDICATED then
 end
 
 CreateWorkspace({name = "filesystem_stdio", abi_compatible = true, path = workspacePath})
+	-- x64 Linux GMod uses the new std::string ABI, only 32 bit has the old one
+	filter({"system:linux", "platforms:x86_64"})
+		undefines("_GLIBCXX_USE_CXX11_ABI")
+	filter({})
 	-- Serverside module (gmsv prefix)
 	-- Can define "source_path", where the source files are located
 	-- Can define "manual_files", which allows you to manually add files to the project,

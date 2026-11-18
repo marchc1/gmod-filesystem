@@ -753,7 +753,7 @@ namespace
 
 		char szCacheDir[MAX_PATH] = { 0 };
 		V_snprintf( szCacheDir, sizeof( szCacheDir ), "%s/steam_cache", szCurrentDir );
-		V_FixSlashes( szCacheDir, '\\' );
+		V_FixSlashes( szCacheDir );
 
 		if ( !get->SteamUGC()->BInitWorkshopForGameServer( 4000, szCacheDir ) )
 			Warning( "WS: BInitWorkshopForGameServer failed!\n" );
