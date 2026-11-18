@@ -2,9 +2,6 @@ name: Build
 
 on:
   push:
-    branches: ['**']
-    # v* tags publish a release. Path filters don't apply to tags
-    tags: ['v*']
     paths:
       - '.github/workflows/compile.yml'
       - 'source/**'
@@ -160,7 +157,7 @@ jobs:
 
   release:
     name: Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name != 'pull_request'
     needs: [windows, linux]
     runs-on: ubuntu-latest
     permissions:
@@ -189,7 +186,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          flags=""
-          case "$GITHUB_REF_NAME" in *-*) flags="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" out/*.zip \
-            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes $flags
+          tag="$(date -u +%Y.%m.%d).${GITHUB_SHA::7}"
+          gh release create "$tag" out/*.zip \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --generate-notes
