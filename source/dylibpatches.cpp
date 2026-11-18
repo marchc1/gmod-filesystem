@@ -451,6 +451,27 @@ namespace
 		GetModuleHandleExA( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCSTR>( &PinSelf ), &hSelf );
 	}
 
+	// The garrysmod folder, from a dll in garrysmod/bin/win64
+	std::string GameDirFromModule( HMODULE hModule )
+	{
+		char szPath[MAX_PATH];
+		DWORD nLen = GetModuleFileNameA( hModule, szPath, sizeof( szPath ) );
+		if ( !nLen || nLen >= sizeof( szPath ) )
+			return {};
+
+		std::string dir = szPath;
+		for ( int i = 0; i < 3; ++i )
+		{
+			size_t nSlash = dir.find_last_of( "\\/" );
+			if ( nSlash == std::string::npos )
+				break;
+
+			dir.resize( nSlash );
+		}
+
+		return dir + '\\';
+	}
+
 	void InstallLuaTiming( HMODULE hLuaShared )
 	{
 		Range text = FindSection( hLuaShared, ".text" );
@@ -482,22 +503,7 @@ namespace
 		pState->m_nFrequency = frequency.QuadPart;
 		pState->m_nStart = Now();
 
-		char szPath[MAX_PATH];
-		DWORD nLen = GetModuleFileNameA( hLuaShared, szPath, sizeof( szPath ) );
-		if ( nLen && nLen < sizeof( szPath ) )
-		{
-			// garrysmod\bin\win64\lua_shared.dll
-			pState->m_OutputDir = szPath;
-			for ( int i = 0; i < 3; ++i )
-			{
-				size_t nSlash = pState->m_OutputDir.find_last_of( "\\/" );
-				if ( nSlash == std::string::npos )
-					break;
-
-				pState->m_OutputDir.resize( nSlash );
-			}
-			pState->m_OutputDir += '\\';
-		}
+		pState->m_OutputDir = GameDirFromModule( hLuaShared );
 
 		g_pState = pState;
 
@@ -1009,6 +1015,267 @@ namespace
 		Msg( "DylibPatches: Lua compression patched\n" );
 	}
 
+	// Every CDmxAttribute name goes through a global symbol table, with a write lock and a tree search.
+	// The table only grows and only holds a few hundred names
+	ConVar filesystem_dmxnamecache( "filesystem_dmxnamecache", "1", 0, "Remember DMX attribute name symbols per thread" );
+
+	struct DmxAttribute
+	{
+		uint32_t m_nType;
+		uint16_t m_nName;
+		void *m_pData;
+	};
+
+	struct DmxNameSlot
+	{
+		const char *m_pName;
+		uint32_t m_nHash;
+		uint16_t m_nSymbol;
+	};
+
+	using DmxAttributeCtorFn = DmxAttribute *( * )( DmxAttribute *pThis, const char *pName );
+
+	constexpr uint32_t kDmxNameSlots = 1 << 13;
+	constexpr uint16_t kInvalidSymbol = 0xFFFF;
+
+	DmxAttributeCtorFn g_pfnDmxAttributeCtor = nullptr;
+	bool g_bDmxNameCacheInstalled = false;
+	bool g_bDmxNameVerify = false;
+	std::atomic<int64_t> g_nDmxNameHits{ 0 };
+	std::atomic<int64_t> g_nDmxNameMisses{ 0 };
+	std::atomic<int64_t> g_nDmxNameVerified{ 0 };
+	std::atomic<int64_t> g_nDmxNameMismatches{ 0 };
+
+	thread_local DmxNameSlot *t_pDmxNames = nullptr;
+	thread_local uint32_t t_nDmxNames = 0;
+
+	// No lock prefix, these are only stats
+	void BumpStat( std::atomic<int64_t> &stat )
+	{
+		stat.store( stat.load( std::memory_order_relaxed ) + 1, std::memory_order_relaxed );
+	}
+
+	DmxAttribute *Hook_DmxAttributeCtor( DmxAttribute *pThis, const char *pName )
+	{
+		if ( !pName || !filesystem_dmxnamecache.GetBool() )
+			return g_pfnDmxAttributeCtor( pThis, pName );
+
+		if ( !t_pDmxNames )
+			t_pDmxNames = new DmxNameSlot[kDmxNameSlots]();
+
+		uint32_t nHash = 2166136261u;
+		size_t nLen = 0;
+		for ( ; pName[nLen]; ++nLen )
+			nHash = ( nHash ^ uint8_t( pName[nLen] ) ) * 16777619u;
+
+		uint32_t nSlot = nHash & ( kDmxNameSlots - 1 );
+		for ( ;; )
+		{
+			DmxNameSlot &slot = t_pDmxNames[nSlot];
+			if ( !slot.m_pName )
+				break;
+
+			if ( slot.m_nHash == nHash && !strcmp( slot.m_pName, pName ) )
+			{
+				if ( g_bDmxNameVerify )
+				{
+					DmxAttribute check;
+					g_pfnDmxAttributeCtor( &check, pName );
+					g_nDmxNameVerified.fetch_add( 1, std::memory_order_relaxed );
+					if ( check.m_nName != slot.m_nSymbol )
+					{
+						if ( g_nDmxNameMismatches.fetch_add( 1, std::memory_order_relaxed ) < 10 )
+							Warning( "DylibPatches: DMX name mismatch for %s, cached %d, table %d\n", pName, slot.m_nSymbol, check.m_nName );
+
+						return g_pfnDmxAttributeCtor( pThis, pName );
+					}
+				}
+
+				pThis->m_nType = 0;
+				pThis->m_nName = slot.m_nSymbol;
+				pThis->m_pData = nullptr;
+				BumpStat( g_nDmxNameHits );
+				return pThis;
+			}
+
+			nSlot = ( nSlot + 1 ) & ( kDmxNameSlots - 1 );
+		}
+
+		g_pfnDmxAttributeCtor( pThis, pName );
+		BumpStat( g_nDmxNameMisses );
+
+		if ( pThis->m_nName != kInvalidSymbol && t_nDmxNames < kDmxNameSlots / 2 )
+		{
+			char *pCopy = new char[nLen + 1];
+			memcpy( pCopy, pName, nLen + 1 );
+
+			DmxNameSlot &slot = t_pDmxNames[nSlot];
+			slot.m_nHash = nHash;
+			slot.m_nSymbol = pThis->m_nName;
+			slot.m_pName = pCopy;
+			++t_nDmxNames;
+		}
+
+		return pThis;
+	}
+
+	void InstallDmxNameCache( HMODULE hClient )
+	{
+		static const int16_t kPattern[] = {
+			0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0xB8, 0xFF, 0xFF, 0x00, 0x00,
+			0x48, 0x8B, 0xF9, 0x66, 0x89, 0x41, 0x04, 0x48, 0x8B, 0xDA,
+			0x48, 0x8D, 0x0D, -1, -1, -1, -1, 0xFF, 0x15, -1, -1, -1, -1,
+			0x4C, 0x8B, 0xC3, 0x48, 0x8D, 0x54, 0x24, 0x30,
+			0x48, 0x8D, 0x0D, -1, -1, -1, -1, 0xE8, -1, -1, -1, -1,
+			0x48, 0x8D, 0x0D, -1, -1, -1, -1, 0xFF, 0x15, -1, -1, -1, -1,
+			0x0F, 0xB7, 0x44, 0x24, 0x30, 0x48, 0x8B, 0x5C, 0x24, 0x38, 0x66, 0x89, 0x47, 0x04,
+			0x33, 0xC0, 0x89, 0x07, 0x48, 0x89, 0x47, 0x08, 0x48, 0x8B, 0xC7,
+			0x48, 0x83, 0xC4, 0x20, 0x5F, 0xC3,
+		};
+
+		Range text = FindSection( hClient, ".text" );
+		const uint8_t *pTarget = FindUniquePattern( text, kPattern, sizeof( kPattern ) / sizeof( kPattern[0] ) );
+		if ( !pTarget )
+		{
+			Warning( "DylibPatches: DMX name cache is off, client.dll pattern not found or not unique\n" );
+			return;
+		}
+
+		g_bDmxNameVerify = CommandLine()->CheckParm( "-dmxnameverify" ) != nullptr;
+
+		std::vector<Detouring::Hook *> hooks;
+		if ( !InstallHook( const_cast<uint8_t *>( pTarget ), reinterpret_cast<void *>( &Hook_DmxAttributeCtor ), reinterpret_cast<void **>( &g_pfnDmxAttributeCtor ), hooks ) || !hooks[0]->Enable() )
+		{
+			Warning( "DylibPatches: DMX name cache is off, hooking failed\n" );
+			return;
+		}
+
+		PinSelf();
+		g_bDmxNameCacheInstalled = true;
+		Msg( "DylibPatches: DMX name cache on%s\n", g_bDmxNameVerify ? ", verifying every hit" : "" );
+	}
+
+	// Timing for CParticleSystemMgr::ReadParticleConfigFile
+	struct ParticleLoad
+	{
+		std::string m_File;
+		std::string m_Script;
+		int64_t m_nStart;
+		int64_t m_nTicks;
+		bool m_bResult;
+	};
+
+	struct ParticleTiming
+	{
+		std::mutex m_Lock;
+		std::vector<ParticleLoad> m_Loads;
+		std::string m_OutputDir;
+		int64_t m_nFrequency = 1;
+		int64_t m_nStart = 0;
+	};
+
+	using ReadParticleConfigFn = bool ( * )( void *pThis, const char *pFileName, bool bPrecache, bool bDecommitTempMemory );
+
+	ParticleTiming *g_pParticles = nullptr;
+	ReadParticleConfigFn g_pfnReadParticleConfig = nullptr;
+
+	std::string CurrentScript()
+	{
+		if ( !t_pStack )
+			return {};
+
+		for ( int i = ( t_nDepth < kMaxDepth ? t_nDepth : kMaxDepth ) - 1; i >= 0; --i )
+		{
+			if ( t_pStack[i].m_Kind == FrameKind::Script )
+				return MakeKey( t_pStack[i].m_pPrefix, t_pStack[i].m_pName );
+		}
+
+		return {};
+	}
+
+	bool Hook_ReadParticleConfig( void *pThis, const char *pFileName, bool bPrecache, bool bDecommitTempMemory )
+	{
+		ParticleLoad load;
+		load.m_File = pFileName ? pFileName : "";
+		load.m_Script = CurrentScript();
+		load.m_nStart = Now();
+		load.m_bResult = g_pfnReadParticleConfig( pThis, pFileName, bPrecache, bDecommitTempMemory );
+		load.m_nTicks = Now() - load.m_nStart;
+
+		bool bResult = load.m_bResult;
+		std::lock_guard<std::mutex> lock( g_pParticles->m_Lock );
+		g_pParticles->m_Loads.push_back( std::move( load ) );
+		return bResult;
+	}
+
+	void InstallParticleTiming( HMODULE hClient )
+	{
+		Range text = FindSection( hClient, ".text" );
+		Range rdata = FindSection( hClient, ".rdata" );
+
+		const uint8_t *pTarget = FindReferencingFunction( text, FindString( rdata, "%s_dx80.%s" ), -1 );
+		if ( !pTarget )
+		{
+			Warning( "DylibPatches: particle timing is off, ReadParticleConfigFile not found\n" );
+			return;
+		}
+
+		auto *pParticles = new ParticleTiming;
+		LARGE_INTEGER frequency;
+		QueryPerformanceFrequency( &frequency );
+		pParticles->m_nFrequency = frequency.QuadPart;
+		pParticles->m_nStart = Now();
+		pParticles->m_OutputDir = GameDirFromModule( hClient );
+		g_pParticles = pParticles;
+
+		std::vector<Detouring::Hook *> hooks;
+		if ( !InstallHook( const_cast<uint8_t *>( pTarget ), reinterpret_cast<void *>( &Hook_ReadParticleConfig ), reinterpret_cast<void **>( &g_pfnReadParticleConfig ), hooks ) || !hooks[0]->Enable() )
+		{
+			g_pParticles = nullptr;
+			Warning( "DylibPatches: particle timing is off, hooking failed\n" );
+			return;
+		}
+
+		PinSelf();
+	}
+
+	void WriteParticleReport()
+	{
+		if ( !g_pParticles )
+			return;
+
+		std::lock_guard<std::mutex> lock( g_pParticles->m_Lock );
+		double flToMs = 1000.0 / g_pParticles->m_nFrequency;
+
+		int64_t nTotal = 0;
+		for ( const ParticleLoad &load : g_pParticles->m_Loads )
+			nTotal += load.m_nTicks;
+
+		Msg( "Particle files: %zu loads, %.1f ms\n", g_pParticles->m_Loads.size(), nTotal * flToMs );
+
+		if ( g_pParticles->m_OutputDir.empty() )
+			return;
+
+		std::string path = g_pParticles->m_OutputDir + "particle_timing.csv";
+		FILE *pFile = fopen( path.c_str(), "wb" );
+		if ( !pFile )
+		{
+			Warning( "DylibPatches: couldn't write %s\n", path.c_str() );
+			return;
+		}
+
+		fputs( "order,file,start_ms,ms,result,script\n", pFile );
+		int nOrder = 0;
+		for ( const ParticleLoad &load : g_pParticles->m_Loads )
+		{
+			fprintf( pFile, "%d,\"%s\",%.3f,%.3f,%d,\"%s\"\n", ++nOrder, load.m_File.c_str(),
+				( load.m_nStart - g_pParticles->m_nStart ) * flToMs, load.m_nTicks * flToMs, load.m_bResult ? 1 : 0, load.m_Script.c_str() );
+		}
+
+		fclose( pFile );
+		Msg( "Wrote %s\n", path.c_str() );
+	}
+
 	// Output
 	double ToMs( int64_t nTicks )
 	{
@@ -1129,6 +1396,15 @@ CON_COMMAND( filesystem_luatiming, "Prints where Lua startup time went and write
 		g_nLookupMismatches = 0;
 		g_nRawServed = 0;
 		g_nRawMissing = 0;
+		g_nDmxNameHits = 0;
+		g_nDmxNameMisses = 0;
+		g_nDmxNameVerified = 0;
+		g_nDmxNameMismatches = 0;
+		if ( g_pParticles )
+		{
+			std::lock_guard<std::mutex> lock( g_pParticles->m_Lock );
+			g_pParticles->m_Loads.clear();
+		}
 		Msg( "Lua timing reset\n" );
 		return;
 	}
@@ -1140,6 +1416,12 @@ CON_COMMAND( filesystem_luatiming, "Prints where Lua startup time went and write
 	Msg( "Lua compression: %s, %lld files kept (%.1f MB), %lld served, %lld not found\n",
 		g_bRawLuaInstalled ? "patched" : "not patched",
 		g_nRawStored.load(), g_nRawBytes.load() / 1048576.0, g_nRawServed.load(), g_nRawMissing.load() );
+
+	Msg( "DMX name cache: %s, %lld hits, %lld misses, %lld verified, %lld mismatches\n",
+		g_bDmxNameCacheInstalled ? "on" : "off",
+		g_nDmxNameHits.load(), g_nDmxNameMisses.load(), g_nDmxNameVerified.load(), g_nDmxNameMismatches.load() );
+
+	WriteParticleReport();
 
 	if ( !g_pState )
 	{
@@ -1176,6 +1458,8 @@ void DylibPatches::OnModuleLoaded( const char *pFileName, CSysModule *pModule )
 		s_bClient = true;
 		InstallLuaLookup( hModule );
 		InstallLuaNoCompress( hModule );
+		InstallParticleTiming( hModule );
+		InstallDmxNameCache( hModule );
 	}
 }
 
