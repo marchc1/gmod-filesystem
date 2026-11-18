@@ -15,36 +15,38 @@ static const std::vector<IGameDepotSystem::Information>& MountableGames()
 {
 	static const std::vector<IGameDepotSystem::Information> mountableGames =
 	{
-		{ 220,     "Half-Life 2 & Episodes",            "hl2",               false, false, false, false, true,  true, { "hl2", "episodic", "ep2", "lostcoast" }},
-		{ 240,     "Counter-Strike: Source",            "cstrike",           false, false, false, false, true,  true  },
-		{ 440,     "Team Fortress 2",                   "tf",                false, false, false, false, true,  false },
-		{ 300,     "Day of Defeat: Source",             "dod",               false, false, false, false, true,  false },
-		{ 320,     "Half-Life 2: Deathmatch",           "hl2mp",             false, false, false, false, true,  false },
-		{ 280,     "Half-Life: Source",                 "hl1",               false, false, false, false, true,  false },
-		{ 360,     "Half-Life Deathmatch: Source",      "hl1mp",             false, false, false, false, true,  false },
+		// mounted, enabled, owned, installed, retail, bundled
+		{ 220,     "Half-Life 2 & Episodes",            "hl2",               true,  true,  false, false, true,  false, { "episodic", "ep2", "lostcoast" } },
+		{ 240,     "Counter-Strike: Source",            "cstrike",           true,  true,  false, false, true,  false },
+		{ 440,     "Team Fortress 2",                   "tf",                true,  true,  false, false, false, false },
+		{ 300,     "Day of Defeat: Source",             "dod",               false, true,  false, false, false, false },
+		{ 320,     "Half-Life 2: Deathmatch",           "hl2mp",             false, true,  false, false, false, false },
+		{ 280,     "Half-Life: Source",                 "hl1",               false, true,  false, false, false, false },
+		{ 360,     "Half-Life Deathmatch: Source",      "hl1mp",             false, true,  false, false, false, false, { "hl1" } },
 		{ 22208,   "Zeno Clash (Model Pack)",           "zeno_clash",        false, false, false, false, false, false },
-		{ 400,     "Portal",                            "portal",            false, false, false, false, true,  false },
+		{ 400,     "Portal",                            "portal",            false, true,  false, false, false, false },
 		{ 17530,   "D.I.P.R.I.P.",                      "diprip",            false, false, false, false, false, false },
-		{ 17500,   "Zombie Panic! Source",              "zps",               false, false, false, false, false, false },
+		{ 17500,   "Zombie Panic! Source",              "zps",               false, false, false, false, false, false, { "vpks" } },
 		{ 17570,   "Pirates, Vikings and Knights II",   "pvkii",             false, false, false, false, false, false },
 		{ 17580,   "Dystopia",                          "dystopia",          false, false, false, false, false, false },
 		{ 17700,   "Insurgency (Source Mod)",           "insurgency",        false, false, false, false, false, false },
+		{ 222880,  "Insurgency (Standalone)",           "insurgency",        false, false, false, false, false, false },
 		{ 17510,   "Age of Chivalry",                   "ageofchivalry",     false, false, false, false, false, false },
-		{ 550,     "Left 4 Dead 2",                     "left4dead2",        false, false, false, false, true,  false },
-		{ 500,     "Left 4 Dead",                       "left4dead",         false, false, false, false, true,  false },
-		{ 620,     "Portal 2",                          "portal2",           false, false, false, false, true,  false },
-		{ 630,     "Alien Swarm",                       "swarm",             false, false, false, false, true,  false },
-		{ 17710,   "Nuclear Dawn",                      "nucleardawn",       false, false, false, false, true,  false },
-		{ 70000,   "Dino D-Day",                        "dinodday",          false, false, false, false, true,  false },
-		{ 730,     "Counter-Strike: GO (Legacy Branch)","csgo",              false, false, false, false, true,  false },
-		{ 225600,  "Blade Symphony",                    "berimbau",          false, false, false, false, true,  false },
-		{ 251110,  "INFRA",                             "infra",             false, false, false, false, true,  false },
-		{ 265630,  "Fistful of Frags",                  "fof",               false, false, false, false, true,  false },
+		{ 550,     "Left 4 Dead 2",                     "left4dead2",        false, true,  false, false, false, false, { "left4dead2_dlc1", "left4dead2_dlc2", "left4dead2_dlc3", "update" } },
+		{ 500,     "Left 4 Dead",                       "left4dead",         false, true,  false, false, false, false, { "left4dead_dlc3" } },
+		{ 620,     "Portal 2",                          "portal2",           false, true,  false, false, false, false, { "portal2_dlc1", "portal2_dlc2" } },
+		{ 630,     "Alien Swarm",                       "swarm",             false, true,  false, false, false, false },
+		{ 17710,   "Nuclear Dawn",                      "nucleardawn",       false, true,  false, false, false, false },
+		{ 70000,   "Dino D-Day",                        "dinodday",          false, true,  false, false, false, false },
+		{ 4465480, "Counter-Strike: GO",                "csgo",              false, true,  false, false, false, false },
+		{ 225600,  "Blade Symphony",                    "berimbau",          false, true,  false, false, false, false },
+		{ 251110,  "INFRA",                             "infra",             false, true,  false, false, false, false },
+		{ 265630,  "Fistful of Frags",                  "fof",               false, true,  false, false, false, false },
 		{ 221910,  "The Stanley Parable",               "thestanleyparable", false, false, false, false, false, false },
-		{ 1224600, "G String Game",                     "gstringv2",         false, false, false, false, true,  false },
-		{ 1786950, "Klaus Veen's Treason",              "treason",           false, false, false, false, true,  false },
-		{ 1012110, "Military Conflict: Vietnam",        "treason",           false, false, false, false, true,  false },
-		{ 362890,  "Black Mesa",                        "bms",               false, false, false, false, true,  false },
+		{ 1224600, "G String Game",                     "gstringv2",         false, true,  false, false, false, false },
+		{ 1786950, "Klaus Veen's Treason",              "treason",           false, true,  false, false, false, false },
+		{ 1012110, "Military Conflict: Vietnam",        "vietnam",           false, true,  false, false, false, false, { "gmod" } },
+		{ 362890,  "Black Mesa",                        "bms",               false, true,  false, false, false, false },
 	};
 
 	return mountableGames;
@@ -146,7 +148,7 @@ bool GameDepot::System::MountAsSteampipe( Information &info, bool bHead )
     for ( const std::string& sub : info.mountSubDirs )
         DoMountDir( info, installDir + "\\" + sub, bHead );
 
-    DoMountDir( info, installDir + "\\", bHead );
+    DoMountDir( info, installDir + "\\" + info.folder, bHead );
     return true;
 #endif
 }
@@ -315,7 +317,7 @@ const char* GameDepot::DoMountDir( IGameDepotSystem::Information& info, const st
 		}
 
 		std::string vpkPath = dir + "/" + pFileName;
-		Bootil::String::Util::GetFindAndReplace( vpkPath, "_000.vpk", "" );
+		Bootil::String::Util::FindAndReplace( vpkPath, "_000.vpk", "" );
 
 		// TODO: developer convar test I think
 		Msg( "MountableGame adding '%s'\n", vpkPath.c_str() );

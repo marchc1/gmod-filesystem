@@ -912,7 +912,7 @@ void Addon::FileSystem::MountFloatingAddons()
 	g_pFullFileSystem->FindClose( hFindHandle );
 }
 
-#ifdef PLATFORM_64BITS
+#if defined( PLATFORM_64BITS ) && defined( _WIN32 )
 static_assert( sizeof( IAddonSystem::Information ) == 0xc0, "GMod reads these out of GetList" );
 #endif
 
