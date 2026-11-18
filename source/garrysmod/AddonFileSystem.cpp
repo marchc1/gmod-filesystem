@@ -197,7 +197,7 @@ bool Addon::FileSystem::MountFile( const std::string& gmaPath, std::vector<std::
 		info.m_nWsid = wsid;
 
 		if ( files )
-			files->push_back( strFileName );
+			files->push_back( strFixedFolder + strFileName );
 
 		auto existing = pFolder->find( strFileName );
 		if ( existing != pFolder->end() )

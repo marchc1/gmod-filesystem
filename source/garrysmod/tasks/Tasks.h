@@ -86,10 +86,12 @@ public:
 
 private:
 	void CheckForWastedSpace();
+	void SendQuery();
 	void OnQueryCompleted( SteamUGCQueryCompleted_t *pResult, bool bIOFailure );
 	CCallResult<GetSubscriptions, SteamUGCQueryCompleted_t> m_Query;
 
 	std::vector<SteamUGCDetails_t> m_Items;
+	uint32 m_nPage = 1;
 	bool m_bReady = false;
 	bool m_bFinished = false;
 };

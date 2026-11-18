@@ -6,9 +6,15 @@ void Addon::Task::GetSubscriptions::Start()
 	m_bFinished = false;
 	m_bReady = false;
 	m_Items.clear();
+	m_nPage = 1;
 
 	m_pAddonSystem->Clear();
 
+	SendQuery();
+}
+
+void Addon::Task::GetSubscriptions::SendQuery()
+{
 	UGCQueryHandle_t handle = SteamUGC()->CreateQueryUserUGCRequest(
 		SteamUser()->GetSteamID().GetAccountID(),
 		k_EUserUGCList_Subscribed,
@@ -16,7 +22,7 @@ void Addon::Task::GetSubscriptions::Start()
 		k_EUserUGCListSortOrder_SubscriptionDateDesc,
 		4000,
 		4000,
-		1
+		m_nPage
 	);
 
 	SteamAPICall_t hCall = SteamUGC()->SendQueryUGCRequest(handle);
@@ -30,9 +36,11 @@ void Addon::Task::GetSubscriptions::CheckForWastedSpace()
 
 void Addon::Task::GetSubscriptions::OnQueryCompleted( SteamUGCQueryCompleted_t *pResult, bool bIOFailure )
 {
-	m_bReady = true;
 	if ( bIOFailure || pResult->m_eResult != k_EResultOK )
+	{
+		m_bReady = true;
 		return;
+	}
 
 	for ( uint32 i = 0; i < pResult->m_unNumResultsReturned; ++i )
 	{
@@ -44,7 +52,19 @@ void Addon::Task::GetSubscriptions::OnQueryCompleted( SteamUGCQueryCompleted_t *
 		}
 	}
 
+	const bool bMore = pResult->m_unNumResultsReturned > 0 && m_nPage * kNumUGCResultsPerPage < pResult->m_unTotalMatchingResults;
+
 	SteamUGC()->ReleaseQueryUGCRequest( pResult->m_handle );
+
+	// Steam hands out 50 per page
+	if ( bMore )
+	{
+		++m_nPage;
+		SendQuery();
+		return;
+	}
+
+	m_bReady = true;
 }
 
 void Addon::Task::GetSubscriptions::Cycle()
