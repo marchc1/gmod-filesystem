@@ -31,10 +31,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # filesystem_stdio.dll
+          # filesystem_stdio.dll with the client dll patches
           - package: win64_client
-            premake_args: ''
-            workspace: vs2022
+            premake_args: '--external-dylib-patches'
+            workspace: vs2022_patches
           # dedicated.dll + server filesystem_stdio.dll
           - package: win64_srcds
             premake_args: '--dedicated'

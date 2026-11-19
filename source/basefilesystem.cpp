@@ -1048,15 +1048,6 @@ void CBaseFileSystem::AddMapPackFile( const char *pPath, const char *pPathID, Se
 {
 	CSearchPathChangeScope changeScope( *m_pPathResolver );
 
-	// RaphaelIT7:
-	// BUG! Even if we already added a .bsp
-	// GMod calls twice for some reason!
-	// So we return as else if we hit RemoveAllMapSearchPaths, we will remove the SearchPath
-	// And the WriteFile for a new map_pack.bsp fails since BeginMapAccess() was already called
-	// Causing the CZipPackFile to have a refCount of 2 and therefore not closing the filehandle, blocking the WriteFile call!
-	if ( m_iMapLoad > 0 )
-		return;
-
 	char tempPathID[MAX_PATH];
 	ParsePathID( pPath, pPathID, tempPathID );
 
@@ -1142,12 +1133,15 @@ void CBaseFileSystem::AddMapPackFile( const char *pPath, const char *pPathID, Se
 				return;
 			}
 
+			if ( V_strieq( newPath, "cache" CORRECT_PATH_SEPARATOR_S "map_pack.bsp" ) )
+				return;
+
 			Msg( "Extracting BSP to cache/map_pack.bsp in order to mount BSP embedded content...\n" );
-			if ( WriteFile( "cache/map_pack.bsp", "MOD_WRITE", mapContents ) )
-				AddMapPackFile( "cache/map_pack.bsp", pPathID, addType );
-			else
+			if ( !WriteFile( "cache/map_pack.bsp", "MOD_WRITE", mapContents ) )
 				::Warning( "Couldn't write cache/map_pack.bsp to mount embedded content!\n" );
 
+			// Same as stock, it's still open during a map reload and can be mounted again
+			AddMapPackFile( "cache/map_pack.bsp", pPathID, addType );
 			return;
 		}
 
