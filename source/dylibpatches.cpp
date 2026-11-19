@@ -1158,6 +1158,142 @@ namespace
 		Msg( "DylibPatches: DMX name cache on%s\n", g_bDmxNameVerify ? ", verifying every hit" : "" );
 	}
 
+	// FindInDatatable copies every name in the Lua file table into a std::string for every search path,
+	// then throws away nearly all of them because they don't start with the path
+	ConVar filesystem_luafindprefix( "filesystem_luafindprefix", "1", 0, "Check the path prefix before copying names in Lua file searches" );
+
+	bool g_bLuaFindInstalled = false;
+	bool g_bLuaFindVerify = false;
+	std::atomic<int64_t> g_nLuaFindChecked{ 0 };
+	std::atomic<int64_t> g_nLuaFindRejected{ 0 };
+	std::atomic<int64_t> g_nLuaFindVerified{ 0 };
+	std::atomic<int64_t> g_nLuaFindMismatches{ 0 };
+
+	// false = skip this name
+	bool CheckLuaFindPrefix( const char *pName, size_t nLen, const std::string *pPrefix )
+	{
+		if ( !filesystem_luafindprefix.GetBool() )
+			return true;
+
+		bool bMatch = nLen >= pPrefix->size() && !memcmp( pName, pPrefix->data(), pPrefix->size() );
+
+		if ( g_bLuaFindVerify )
+		{
+			bool bExpected = std::string( pName, nLen ).find( *pPrefix, 0 ) == 0;
+			g_nLuaFindVerified.fetch_add( 1, std::memory_order_relaxed );
+			if ( bExpected != bMatch )
+			{
+				if ( g_nLuaFindMismatches.fetch_add( 1, std::memory_order_relaxed ) < 10 )
+					Warning( "DylibPatches: Lua find prefix mismatch for %s, prefix %s\n", pName, pPrefix->c_str() );
+
+				bMatch = bExpected;
+			}
+		}
+
+		BumpStat( g_nLuaFindChecked );
+		if ( !bMatch )
+			BumpStat( g_nLuaFindRejected );
+
+		return bMatch;
+	}
+
+	void InstallLuaFindPrefix( HMODULE hClient )
+	{
+		// From the top of the table loop to the StartsWith check
+		static const int16_t kPattern[] = {
+			0x49, 0x8B, 0x4E, 0x08, 0x48, 0x8B, 0x01, 0xFF, 0x50, 0x18, 0x85, 0xC0, 0x0F, 0x8E, -1, -1,
+			-1, -1, 0x49, 0x8B, 0x4E, 0x08, 0x8B, 0xD3, 0x48, 0x8B, 0x01, 0xFF, 0x50, 0x48, 0x49, 0xC7,
+			0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0x48, 0xC7, 0x44, 0x24, 0x70, 0x00, 0x00, 0x00, 0x00, 0x48, 0xC7,
+			0x45, 0x80, 0x00, 0x00, 0x00, 0x00, 0x48, 0xC7, 0x45, 0x88, 0x0F, 0x00, 0x00, 0x00, 0x66, 0x90,
+			0x49, 0xFF, 0xC0, 0x42, 0x80, 0x3C, 0x00, 0x00, 0x75, 0xF6, 0x48, 0x8B, 0xD0, 0x48, 0x8D, 0x4C,
+			0x24, 0x70, 0xE8, -1, -1, -1, -1, 0x48, 0x8B, 0x45, 0x10, 0x48, 0x39, 0x45, 0x80, 0x73,
+			0x45, 0x48, 0x8B, 0x55, 0x88, 0x48, 0x83, 0xFA, 0x10, 0x0F, 0x82, -1, -1, -1, -1, 0x48,
+			0x8B, 0x4C, 0x24, 0x70, 0x48, 0xFF, 0xC2, 0x48, 0x8B, 0xC1, 0x48, 0x81, 0xFA, 0x00, 0x10, 0x00,
+			0x00, 0x72, 0x19, 0x48, 0x8B, 0x49, 0xF8, 0x48, 0x83, 0xC2, 0x27, 0x48, 0x2B, 0xC1, 0x48, 0x83,
+			0xC0, 0xF8, 0x48, 0x83, 0xF8, 0x1F, 0x0F, 0x87, -1, -1, -1, -1, 0xE8, -1, -1, -1,
+			-1, 0xE9, -1, -1, -1, -1, 0x48, 0x8D, 0x54, 0x24, 0x70, 0x48, 0x8D, 0x4D, 0x20, 0xE8,
+			-1, -1, -1, -1, 0x84, 0xC0, 0x74, 0xA9, 0x48, 0x8D, 0x95, 0xA8, 0x00, 0x00, 0x00, 0x48,
+			0x8D, 0x4C, 0x24, 0x70, 0xE8, -1, -1, -1, -1, 0x84, 0xC0, 0x74, 0x94,
+		};
+		constexpr size_t kSiteOffset = 0x4A;
+		constexpr size_t kSiteSize = 8;
+		constexpr size_t kResumeOffset = 0x52;
+		constexpr size_t kRejectRelOffset = 0x6B;
+
+		Range text = FindSection( hClient, ".text" );
+		const uint8_t *pMatch = FindUniquePattern( text, kPattern, sizeof( kPattern ) / sizeof( kPattern[0] ) );
+		if ( !pMatch )
+		{
+			Warning( "DylibPatches: Lua find patch is off, client.dll pattern not found or not unique\n" );
+			return;
+		}
+
+		int32_t nRejectRelative;
+		memcpy( &nRejectRelative, pMatch + kRejectRelOffset, sizeof( nRejectRelative ) );
+		const uint8_t *pReject = pMatch + kRejectRelOffset + 4 + nRejectRelative;
+		const uint8_t *pResume = pMatch + kResumeOffset;
+		uint8_t *pSite = const_cast<uint8_t *>( pMatch + kSiteOffset );
+
+		constexpr size_t kStubSize = 0x1000;
+		uint8_t *pStub = static_cast<uint8_t *>( AllocNear( pSite, kStubSize ) );
+		if ( !pStub )
+		{
+			Warning( "DylibPatches: Lua find patch is off, no memory near client.dll\n" );
+			return;
+		}
+
+		// rax = name, r8 = length. The two stack slots are outgoing args, nothing reads them back
+		StubWriter stub( pStub );
+		stub.Bytes( { 0x48, 0x89, 0x44, 0x24, 0x20 } );					// mov [rsp+0x20], rax
+		stub.Bytes( { 0x4C, 0x89, 0x44, 0x24, 0x28 } );					// mov [rsp+0x28], r8
+		stub.Bytes( { 0x48, 0x8B, 0xC8 } );								// mov rcx, rax
+		stub.Bytes( { 0x49, 0x8B, 0xD0 } );								// mov rdx, r8
+		stub.Bytes( { 0x4C, 0x8D, 0x85, 0xA8, 0x00, 0x00, 0x00 } );		// lea r8, [rbp+0xA8]
+		stub.Bytes( { 0x48, 0xB8 } );									// mov rax, CheckLuaFindPrefix
+		stub.Pointer( reinterpret_cast<const void *>( &CheckLuaFindPrefix ) );
+		stub.Bytes( { 0xFF, 0xD0 } );									// call rax
+		stub.Bytes( { 0x4C, 0x8B, 0x44, 0x24, 0x28 } );					// mov r8, [rsp+0x28]
+		stub.Bytes( { 0x84, 0xC0 } );									// test al, al
+		stub.Bytes( { 0x48, 0x8B, 0x44, 0x24, 0x20 } );					// mov rax, [rsp+0x20]
+		stub.Bytes( { 0x0F, 0x84 } );									// je next name
+		stub.Relative( pReject );
+		stub.Bytes( { 0x48, 0x8B, 0xD0 } );								// mov rdx, rax
+		stub.Bytes( { 0x48, 0x8D, 0x4C, 0x24, 0x70 } );					// lea rcx, [rsp+0x70]
+		stub.Bytes( { 0xE9 } );											// jmp back
+		stub.Relative( pResume );
+
+		memcpy( pStub, stub.Data(), stub.Size() );
+
+		DWORD nOldProtect;
+		if ( !VirtualProtect( pStub, kStubSize, PAGE_EXECUTE_READ, &nOldProtect ) )
+		{
+			VirtualFree( pStub, 0, MEM_RELEASE );
+			Warning( "DylibPatches: Lua find patch is off, couldn't protect the stub\n" );
+			return;
+		}
+		FlushInstructionCache( GetCurrentProcess(), pStub, stub.Size() );
+
+		PinSelf();
+		g_bLuaFindVerify = CommandLine()->CheckParm( "-luafindverify" ) != nullptr;
+
+		uint8_t patch[kSiteSize] = { 0xE9, 0, 0, 0, 0, 0x0F, 0x1F, 0x00 };
+		int32_t nStubRelative = int32_t( pStub - ( pSite + 5 ) );
+		memcpy( patch + 1, &nStubRelative, sizeof( nStubRelative ) );
+
+		if ( !VirtualProtect( pSite, kSiteSize, PAGE_EXECUTE_READWRITE, &nOldProtect ) )
+		{
+			Warning( "DylibPatches: Lua find patch is off, couldn't patch client.dll\n" );
+			return;
+		}
+
+		memcpy( pSite, patch, kSiteSize );
+		VirtualProtect( pSite, kSiteSize, nOldProtect, &nOldProtect );
+		FlushInstructionCache( GetCurrentProcess(), pSite, kSiteSize );
+
+		g_bLuaFindInstalled = true;
+		Msg( "DylibPatches: Lua find patched%s\n", g_bLuaFindVerify ? ", verifying every check" : "" );
+	}
+
 	// Lua refresh's folder watcher walks every folder just to find symlinks, Windows covers the rest.
 	// The walk moves to a thread, the watcher gets restarted with the links on the next poll
 	enum class LuaWatchMode
@@ -1771,6 +1907,10 @@ CON_COMMAND( filesystem_luatiming, "Prints where Lua startup time went and write
 		g_nDmxNameMisses = 0;
 		g_nDmxNameVerified = 0;
 		g_nDmxNameMismatches = 0;
+		g_nLuaFindChecked = 0;
+		g_nLuaFindRejected = 0;
+		g_nLuaFindVerified = 0;
+		g_nLuaFindMismatches = 0;
 		if ( g_pParticles )
 		{
 			std::lock_guard<std::mutex> lock( g_pParticles->m_Lock );
@@ -1791,6 +1931,9 @@ CON_COMMAND( filesystem_luatiming, "Prints where Lua startup time went and write
 	Msg( "DMX name cache: %s, %lld hits, %lld misses, %lld verified, %lld mismatches\n",
 		g_bDmxNameCacheInstalled ? "on" : "off",
 		g_nDmxNameHits.load(), g_nDmxNameMisses.load(), g_nDmxNameVerified.load(), g_nDmxNameMismatches.load() );
+
+	Msg( "Lua find: %s, %lld names checked, %lld skipped, %lld verified, %lld mismatches\n",
+		g_bLuaFindInstalled ? "patched" : "not patched", g_nLuaFindChecked.load(), g_nLuaFindRejected.load(), g_nLuaFindVerified.load(), g_nLuaFindMismatches.load() );
 
 	Msg( "Lua watch thread: %s, %lld folders, %lld links, walk %.1f ms, %lld merges, last merge %.1f ms, %lld polls saw changes\n",
 		g_bLuaWatchInstalled ? "on" : "off", g_nLuaWatchDirs.load(), g_nLuaWatchLinks.load(),
@@ -1841,6 +1984,7 @@ void DylibPatches::OnModuleLoaded( const char *pFileName, CSysModule *pModule )
 		InstallLuaNoCompress( hModule );
 		InstallParticleTiming( hModule );
 		InstallDmxNameCache( hModule );
+		InstallLuaFindPrefix( hModule );
 	}
 
 	static bool s_bServer = false;
