@@ -27,6 +27,7 @@ struct MountedAddon
 	uint64_t m_nWsid;
 	uint64_t m_nWsid2;
 	bool m_bDeleteOnUnmount;
+	bool m_bFromMountFile = false;
 };
 
 struct SearchFile
@@ -90,6 +91,7 @@ public: // FileSystem
 	void NormalizePath( std::string &strFileName );
 	void SendUGCListUpdate();
 	bool UnmountFile( std::string strFileName, const char *pszReason );
+	void UnmountPackFile( FileHandle_t hFileHandle );
 	bool MountAddon( IAddonSystem::Information &info );
 	std::string ResolveFile( std::string strRelativeFileName );
 	int64_t GetFileSize( std::string strRelativeFileName );
@@ -108,6 +110,7 @@ public: // FileSystem
 
 private:
 	bool m_bChanged = false;
+	bool m_bLoadedNoMount = false;
 	std::string m_strModPath;
 	std::list<IAddonSystem::Information> m_Addons;
 	std::list<IAddonSystem::UGCInfo> m_UgcAddons;

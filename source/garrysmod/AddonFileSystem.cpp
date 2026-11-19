@@ -16,7 +16,10 @@ void Addon::FileSystem::Clear()
 	for ( auto &pAddon : m_MountedAddons )
 	{
 		if ( pAddon.m_hFileHandle != FILESYSTEM_INVALID_HANDLE )
+		{
+			Addon::FileHandle::OnPackFileUnmounted( pAddon.m_hFileHandle );
 			g_pFullFileSystem->Close( pAddon.m_hFileHandle );
+		}
 	}
 
 	m_MountedAddons.clear();
@@ -49,6 +52,7 @@ void Addon::FileSystem::Refresh()
 	}
 
 	Msg( "Mounted %i of %i workshop addons!\n", nMounted, (int)m_Addons.size() );
+	m_bChanged = false;
 }
 
 Addon::Folder* Addon::FileSystem::GetFolder( const std::string &strPath, bool bCreate )
@@ -121,12 +125,14 @@ bool Addon::FileSystem::MountFile( const std::string& gmaPath, std::vector<std::
 	Bootil::String::Lower( lowerAddonPath );
 
 	bool alreadyMounted = false;
+	bool bMountedPermanently = false;
 	for ( auto it = m_MountedAddons.begin(); it != m_MountedAddons.end(); ++it )
 	{
 		const std::string& mountedPath = it->m_strPath;
 		if ( Bootil::String::Test::EndsWith( lowerAddonPath, mountedPath ) )
 		{
 			alreadyMounted = true;
+			bMountedPermanently = !it->m_bDeleteOnUnmount;
 			break;
 		}
 	}
@@ -154,10 +160,11 @@ bool Addon::FileSystem::MountFile( const std::string& gmaPath, std::vector<std::
 		return false;
 	}
 
-	const bool addonFlag = !alreadyMounted &&
+	const bool addonFlag = !bMountedPermanently &&
 		( source == IAddonSystem::AddonSource( 1 ) || source == IAddonSystem::AddonSource( 2 ) );
 
 	MountedAddon addon;
+	addon.m_bFromMountFile = true;
 	addon.m_strPath = strAddonPath;
 	addon.m_strTitle = "";
 	addon.m_hFileHandle = hFileHandle;
@@ -219,19 +226,12 @@ bool Addon::FileSystem::MountFile( const std::string& gmaPath, std::vector<std::
 bool Addon::FileSystem::ShouldMount( uint64_t wsid )
 {
 	FS_TRACE( "Addon::FileSystem::ShouldMount (%llu)\n", wsid );
-	auto it = m_AddonNoMount.find( wsid );
-	if ( it != m_AddonNoMount.end() )
-		return false;
+	Load();
 
-	for ( IAddonSystem::Information info : m_Addons )
-	{
-		if ( info.wsid == wsid )
-			return true;
-	}
+	if ( wsid == 0 )
+		return true;
 
-	FS_TRACE( "CAddonFileSystem::ShouldMount Nope? (%llu)\n", wsid );
-
-	return false;
+	return m_AddonNoMount.find( wsid ) == m_AddonNoMount.end();
 }
 
 // RaphaelIT7 (Verify): Does it truly return bShouldMount? Seems like that in IDA for both linux & macos
@@ -256,21 +256,13 @@ void Addon::FileSystem::Save()
 	KeyValues* kv = new KeyValues( "addonnomount" );
 	RunCodeAtScopeExit( kv->deleteThis(); );
 
-	KeyValues* list = kv->CreateNewKey();
-
-	int i = 0;
-	char szIDBuffer[21];
 	char szWSIDBuffer[21];
 	for ( auto wsid : m_AddonNoMount )
 	{
-		++i;
 		auto [wsPtr, _] = std::to_chars( szWSIDBuffer, szWSIDBuffer + sizeof( szWSIDBuffer ) - 1, wsid );
 		*wsPtr = '\0';
 
-		auto [idPtr, _2] = std::to_chars( szIDBuffer, szIDBuffer + sizeof( szIDBuffer ) - 1, i );
-		*idPtr = '\0';
-
-		list->SetString( szIDBuffer, szWSIDBuffer );
+		kv->CreateNewKey()->SetStringValue( szWSIDBuffer );
 	}
 
 	kv->SaveToFile( g_pFullFileSystem, "cfg/addonnomount.txt", "DEFAULT_WRITE_PATH" );
@@ -344,17 +336,19 @@ void Addon::FileSystem::OnRemoteStoragePublishedFileUnsubscribed( RemoteStorageP
 	if ( info->m_nAppID != SteamUtils()->GetAppID() )
 		return;
 
-	for ( auto it = m_MountedAddons.begin(); it != m_MountedAddons.end(); ++it )
+	SetShouldMount( info->m_nPublishedFileId, true );
+
+	for ( auto it = m_Addons.begin(); it != m_Addons.end(); ++it )
 	{
-		if ( it->m_nWsid != info->m_nPublishedFileId )
+		if ( it->wsid != info->m_nPublishedFileId )
 			continue;
 
-		UnmountFile( it->m_strPath, "addon unsubscribed" );
-		if ( it->m_bDeleteOnUnmount )
-			g_pFullFileSystem->RemoveFile( it->m_strPath.c_str(), "MOD" );
+		UnmountFile( it->file, "addon unsubscribed" );
+		if ( it->legacy )
+			g_pFullFileSystem->RemoveFile( it->file.c_str(), "MOD" );
 
-		EnableLoadingUnloadedAddons(); // ???
-		// Some other call here?
+		m_Addons.erase( it );
+		MarkChanged();
 		AddJob( new Addon::Task::MountAvailable() );
 		SendUGCListUpdate();
 		return;
@@ -424,11 +418,45 @@ bool Addon::FileSystem::UnmountFile( std::string strFileName, const char *pszRea
 			continue;
 
 		Warning( "Unmounting (%s) '%s'\n", pszReason, strFileName.c_str() );
-		// UnmountPackFile( it->m_hFileHandle, false );
+		UnmountPackFile( it->m_hFileHandle );
+		m_MountedAddons.erase( it );
 		return true;
 	}
 
 	return false;
+}
+
+void Addon::FileSystem::UnmountPackFile( FileHandle_t hFileHandle )
+{
+	if ( !hFileHandle )
+		return;
+
+	for ( auto folderIt = m_Folders.begin(); folderIt != m_Folders.end(); )
+	{
+		Folder &folder = folderIt->second;
+		for ( auto fileIt = folder.begin(); fileIt != folder.end(); )
+		{
+			if ( fileIt->second.m_hFileHandle != hFileHandle )
+			{
+				++fileIt;
+				continue;
+			}
+
+			if ( fs_tellmeyoursecrets.GetBool() )
+				Msg( "Unmounting '%s/%s'\n", folderIt->first.c_str(), fileIt->first.c_str() );
+
+			fileIt = folder.erase( fileIt );
+		}
+
+		if ( folder.empty() )
+			folderIt = m_Folders.erase( folderIt );
+		else
+			++folderIt;
+	}
+
+	Addon::FileHandle::OnPackFileUnmounted( hFileHandle );
+	g_pFullFileSystem->Close( hFileHandle );
+	MarkChanged();
 }
 
 bool Addon::FileSystem::MountAddon( IAddonSystem::Information &info )
@@ -706,6 +734,17 @@ void Addon::FileSystem::Think()
 		return;
 	}
 
+	if ( !m_Subscriptions.empty() )
+	{
+		for ( const SteamUGCDetails_t &details : m_Subscriptions )
+			AddAddonFromSteamDetails( details );
+
+		m_Subscriptions.clear();
+		AddJob( new Task::DownloadAddons( true ) );
+		SendUGCListUpdate();
+		return;
+	}
+
 	if ( m_bChanged )
 	{
 		m_bChanged = false;
@@ -732,7 +771,7 @@ IAddonDownloadNotification *Addon::FileSystem::Notify()
 bool Addon::FileSystem::IsSubscribed( uint64_t wsid )
 {
 	FS_TRACE( "Addon::FileSystem::IsSubscribed (%llu)\n", wsid );
-	for ( IAddonSystem::Information info : m_Addons )
+	for ( const IAddonSystem::Information &info : m_Addons )
 	{
 		if ( info.wsid == wsid )
 			return true;
@@ -835,11 +874,47 @@ std::string Addon::FileSystem::GetAddonFilepath( uint64_t wsid, bool bGMAOnly )
 void Addon::FileSystem::UnmountAddon( uint64_t wsid, const char *pszReason )
 {
 	FS_TRACE( "Addon::FileSystem::UnmountAddon (%llu - %s)\n", wsid, pszReason );
+	if ( wsid == 0 )
+		return;
+
+	for ( const MountedAddon &addon : m_MountedAddons )
+	{
+		if ( addon.m_nWsid != wsid )
+			continue;
+
+		UnmountFile( addon.m_strPath, pszReason );
+		return;
+	}
 }
 
 void Addon::FileSystem::UnmountServerAddons()
 {
 	FS_TRACE( "Addon::FileSystem::UnmountServerAddons\n" );
+
+	bool bUnmounted = false;
+	std::vector<MountedAddon> keep;
+	for ( const MountedAddon &addon : m_MountedAddons )
+	{
+		if ( addon.m_bDeleteOnUnmount )
+		{
+			Warning( "Unmounting server downloaded addon '%s'\n", addon.m_strPath.c_str() );
+			bUnmounted = true;
+		}
+		else if ( addon.m_bFromMountFile )
+		{
+			keep.push_back( addon );
+		}
+	}
+
+	if ( !bUnmounted )
+		return;
+
+	// Full remount, the server addon may have replaced files from other addons
+	Clear();
+	Refresh();
+
+	for ( const MountedAddon &addon : keep )
+		MountFile( addon.m_strPath, nullptr, addon.m_nWsid, addon.m_nWsid2, IAddonSystem::AddonSource( 0 ) );
 }
 
 std::string Addon::FileSystem::IsAddonValidPreInstall( SteamUGCDetails_t details )
@@ -1037,6 +1112,7 @@ void Addon::FileSystem::AddUGCFile( SteamUGCDetails_t details, Addon::AddonType 
 void Addon::FileSystem::OnAddonSubscribed( const SteamUGCDetails_t &details )
 {
 	FS_TRACE( "Addon::FileSystem::OnAddonSubscribed (%llu)\n", details.m_nPublishedFileId );
+	m_Subscriptions.push_back( details );
 }
 
 void Addon::FileSystem::AddUnloadedSubscription( uint64_t wsid )
@@ -1064,15 +1140,67 @@ void Addon::FileSystem::OnAddonDownloaded( const IAddonSystem::Information &info
 {
 	FS_TRACE( "Addon::FileSystem::AddonDownloaded (%llu)\n", info.wsid );
 	MarkChanged();
+
+	for ( IAddonSystem::Information &addon : m_Addons )
+	{
+		if ( addon.wsid != info.wsid )
+			continue;
+
+		addon.legacy = info.legacy;
+		addon.canUpdate = false;
+		addon.downloaded = true;
+	}
 }
 
 void Addon::FileSystem::OnAddonDownloadFailed( const IAddonSystem::Information &info )
 {
 	FS_TRACE( "Addon::FileSystem::OnAddonDownloadFailed (%llu)\n", info.wsid );
+
+	for ( IAddonSystem::Information &addon : m_Addons )
+	{
+		if ( addon.wsid != info.wsid )
+			continue;
+
+		addon.legacy = info.legacy;
+		addon.canUpdate = false;
+		addon.downloaded = false;
+		addon.unknown_b6 = true;
+	}
 }
 
 void Addon::FileSystem::Load()
 {
+	if ( m_bLoadedNoMount )
+		return;
+
+	m_bLoadedNoMount = true;
+
+	if ( !g_pFullFileSystem->FileExists( "cfg/addonnomount.txt", "DEFAULT_WRITE_PATH" ) )
+		return;
+
+	KeyValues* kv = new KeyValues( "addonnomount" );
+	RunCodeAtScopeExit( kv->deleteThis(); );
+
+	if ( !kv->LoadFromFile( g_pFullFileSystem, "cfg/addonnomount.txt", "DEFAULT_WRITE_PATH" ) )
+		return;
+
+	auto addValues = [this]( KeyValues *pList )
+	{
+		for ( KeyValues *pValue = pList->GetFirstValue(); pValue; pValue = pValue->GetNextValue() )
+		{
+			const uint64_t wsid = Bootil::String::To::UInt64( pValue->GetString() );
+			if ( !m_Addons.empty() && wsid != 0 && !IsSubscribed( wsid ) )
+				continue;
+
+			SetShouldMount( wsid, false );
+		}
+	};
+
+	addValues( kv );
+
+	// Our Save used to nest the list one level down
+	for ( KeyValues *pList = kv->GetFirstTrueSubKey(); pList; pList = pList->GetNextTrueSubKey() )
+		addValues( pList );
 }
 
 void Addon::FileSystem::FindInAddon( const std::string &pPath, const std::string &pWildcard, std::list<Addon::SearchFile> &results )

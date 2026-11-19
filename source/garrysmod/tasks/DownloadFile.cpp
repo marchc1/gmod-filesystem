@@ -53,6 +53,24 @@ void Addon::Task::DownloadFile::OnItemDownloaded( DownloadItemResult_t *pResult 
 		Warning( "OnItemDownloaded: invalid app id %i?\n", pResult->m_unAppID );
 		return;
 	}
+
+	// Registered from the constructor, could be another item or a job that hasnt started
+	if ( m_bIsFinished || pResult->m_nPublishedFileId != m_Info.wsid )
+		return;
+
+	m_bIsFinished = true;
+	m_Info.legacy = ( SteamUGC()->GetItemState( m_Info.wsid ) & k_EItemStateLegacyItem ) != 0;
+
+	if ( m_pAddonSystem->Notify() )
+		m_pAddonSystem->Notify()->FinishDownload( m_Info.wsid );
+
+	m_pAddonSystem->OnAddonDownloaded( m_Info );
+
+	if ( pResult->m_eResult != k_EResultOK )
+	{
+		Warning( "Error downloading file %s (%llu): %i\n", m_Info.title.c_str(), m_Info.wsid, (int)pResult->m_eResult );
+		NotifyFailed( "Steam failed to download the addon" );
+	}
 }
 
 void Addon::Task::DownloadFile::Start()
@@ -68,6 +86,8 @@ void Addon::Task::DownloadFile::Start()
 			// RaphaelIT7:
 			// GMod manually registers the callback m_downloadCallback here
 			// BUUUT the newer CCallback class from Steam already takes care of that!
+			m_bIsFinished = false;
+			m_WarningTimer.Start();
 
 			if ( m_pAddonSystem->Notify() )
 			{
@@ -82,6 +102,12 @@ void Addon::Task::DownloadFile::Start()
 		}
 		return;
 	}
+
+	m_pAddonSystem->OnAddonDownloaded( m_Info );
+
+	// Steam got it done before we started, only legacy items have something to extract
+	if ( !m_Info.legacy )
+		return;
 
 	Bootil::String::File::FixSlashes( m_Info.file );
 
@@ -102,7 +128,7 @@ void Addon::Task::DownloadFile::Cycle()
 		return;
 
 	uint64 nDownloadedBytes = 0, nTotalBytes = 0;
-	if ( SteamUGC()->GetItemDownloadInfo( m_Info.wsid, &nDownloadedBytes, &nTotalBytes ) )
+	if ( SteamUGC()->GetItemDownloadInfo( m_Info.wsid, &nDownloadedBytes, &nTotalBytes ) && nTotalBytes > 0 )
 	{
 		m_pAddonSystem->Notify()->DownloadProgress( m_Info.wsid, m_Info.hcontent_preview, m_Info.title.c_str(), nDownloadedBytes, nTotalBytes );
 		m_nBytesTransferred += nDownloadedBytes - m_nPrevDownloadedBytes;

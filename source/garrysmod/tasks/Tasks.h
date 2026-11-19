@@ -137,7 +137,11 @@ public:
 
 	OnSubscribed( uint64_t wsid );
 private:
+	void OnDetails( SteamUGCRequestUGCDetailsResult_t *pResult, bool bIOFailure );
+	CCallResult<OnSubscribed, SteamUGCRequestUGCDetailsResult_t> m_Query;
+
 	uint64_t m_WSID;
+	bool m_bFinished = false;
 };
 
 class UpdateTotals : public Addon::Job::Base

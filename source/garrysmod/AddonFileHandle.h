@@ -20,9 +20,10 @@ class FileHandle
 {
 public:
 	FileHandle( Addon::FileInfo* pInfo );
+	~FileHandle();
 
 	// Called from Addon::FileSystem::Clear & Addon::FileSystem::UnmountPackFile
-	void OnPackFileUnmounted( void *pUnknown );
+	static void OnPackFileUnmounted( FileHandle_t hFileHandle );
 
 	// Unused? Perhaps used on the client...
 	void CheckPackFileUnmounted( void *pUnknown );
